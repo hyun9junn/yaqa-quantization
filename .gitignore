@@ -14,3 +14,4 @@ fast-hadamard-transform/build/
 fast-hadamard-transform/dist/
 report*.nsys-rep
 report*.sqlite
+outputs/

@@ -44,6 +44,8 @@ parser.add_argument('--save_path', type=str)
 parser.add_argument('--orig_model', type=str)
 parser.add_argument('--cpu_offload', action='store_true')
 parser.add_argument('--fp64_accum', action='store_true')
+parser.add_argument('--cross', action='store_true', default=False)
+parser.add_argument('--align_mode', choices=['ortho', 'rect'], default='rect')
 args = parser.parse_args()
 
 
@@ -85,6 +87,7 @@ else:
 
 device_ct = 0
 with torch.autograd.set_grad_enabled(False):
+    gidx = 0
     for i in range(len(model.model.layers)):
         l = model.model.layers[i]
         collect_hess = (i >= args.start_layer and i < args.end_layer)
@@ -93,7 +96,8 @@ with torch.autograd.set_grad_enabled(False):
         name = f'{i}_q'
         new_q = custom_linear_layer(device_ct % local_world_size,
                                     args.cpu_offload,
-                                    os.path.join(args.save_path, name),
+                                    name,
+                                    gidx, 'q',
                                     collect_hess,
                                     args.fp64_accum,
                                     l.self_attn.q_proj.in_features,
@@ -103,11 +107,13 @@ with torch.autograd.set_grad_enabled(False):
         del l.self_attn.q_proj
         l.self_attn.q_proj = new_q
         device_ct += 1
+        gidx += 1
 
         name = f'{i}_k'
         new_k = custom_linear_layer(device_ct % local_world_size,
                                     args.cpu_offload,
-                                    os.path.join(args.save_path, name),
+                                    name,
+                                    gidx, 'k',
                                     collect_hess,
                                     args.fp64_accum,
                                     l.self_attn.k_proj.in_features,
@@ -117,11 +123,13 @@ with torch.autograd.set_grad_enabled(False):
         del l.self_attn.k_proj
         l.self_attn.k_proj = new_k
         device_ct += 1
+        gidx += 1
 
         name = f'{i}_v'
         new_v = custom_linear_layer(device_ct % local_world_size,
                                     args.cpu_offload,
-                                    os.path.join(args.save_path, name),
+                                    name,
+                                    gidx, 'v',
                                     collect_hess,
                                     args.fp64_accum,
                                     l.self_attn.v_proj.in_features,
@@ -131,11 +139,13 @@ with torch.autograd.set_grad_enabled(False):
         del l.self_attn.v_proj
         l.self_attn.v_proj = new_v
         device_ct += 1
+        gidx += 1
 
         name = f'{i}_o'
         new_o = custom_linear_layer(device_ct % local_world_size,
                                     args.cpu_offload,
-                                    os.path.join(args.save_path, name),
+                                    name,
+                                    gidx, 'o',
                                     collect_hess,
                                     args.fp64_accum,
                                     l.self_attn.o_proj.in_features,
@@ -145,11 +155,13 @@ with torch.autograd.set_grad_enabled(False):
         del l.self_attn.o_proj
         l.self_attn.o_proj = new_o
         device_ct += 1
+        gidx += 1
 
         name = f'{i}_up'
         new_up = custom_linear_layer(device_ct % local_world_size,
                                      args.cpu_offload,
-                                     os.path.join(args.save_path, name),
+                                     name,
+                                     gidx, 'up',
                                      collect_hess,
                                      args.fp64_accum,
                                      l.mlp.up_proj.in_features,
@@ -159,11 +171,13 @@ with torch.autograd.set_grad_enabled(False):
         del l.mlp.up_proj
         l.mlp.up_proj = new_up
         device_ct += 1
+        gidx += 1
 
         name = f'{i}_gate'
         new_gate = custom_linear_layer(device_ct % local_world_size,
                                        args.cpu_offload,
-                                       os.path.join(args.save_path, name),
+                                       name,
+                                       gidx, 'gate',
                                        collect_hess,
                                        args.fp64_accum,
                                        l.mlp.gate_proj.in_features,
@@ -173,11 +187,13 @@ with torch.autograd.set_grad_enabled(False):
         del l.mlp.gate_proj
         l.mlp.gate_proj = new_gate
         device_ct += 1
+        gidx += 1
 
         name = f'{i}_down'
         new_down = custom_linear_layer(device_ct % local_world_size,
                                        args.cpu_offload,
-                                       os.path.join(args.save_path, name),
+                                       name,
+                                       gidx, 'down',
                                        collect_hess,
                                        args.fp64_accum,
                                        l.mlp.down_proj.in_features,
@@ -187,6 +203,7 @@ with torch.autograd.set_grad_enabled(False):
         del l.mlp.down_proj
         l.mlp.down_proj = new_down
         device_ct += 1
+        gidx += 1
 
 auto_wrap_policy = partial(transformer_auto_wrap_policy,
                            transformer_layer_cls={
@@ -236,7 +253,7 @@ for pit in range(args.power_iters):
 
         torch.distributed.scatter(batch, blist, src=0)
         logits = model(batch,
-                       mode=(pit, i == 0, i == (cutoff - 1)),
+                       mode=(pit, i == 0, i == (cutoff - 1), args.cross, args.align_mode),
                        use_cache=False)['logits']
         logits = logits.view(-1, logits.shape[-1]).float()
 
@@ -258,5 +275,14 @@ for pit in range(args.power_iters):
                     torch.save(
                         l.hout / ct,
                         os.path.join(args.save_path, f'{l.fname}_hout.pt'))
+                    
+                if hasattr(l, 'cross_hin') and l.cross_hin is not None:
+                    torch.save(
+                        l.cross_hin / ct,
+                        os.path.join(args.save_path, f'{l.fname}_cross_hin.pt'))
+                if hasattr(l, 'cross_hout') and l.cross_hout is not None:
+                    torch.save(
+                        l.cross_hout / ct,
+                        os.path.join(args.save_path, f'{l.fname}_cross_hout.pt'))
 
             print(f'RANK {local_rank} SAVED CURRENT HESSIANS')
