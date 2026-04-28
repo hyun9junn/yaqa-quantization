@@ -1,0 +1,8 @@
+LICENSE
+README.md
+pyproject.toml
+yaqa_quantization.egg-info/PKG-INFO
+yaqa_quantization.egg-info/SOURCES.txt
+yaqa_quantization.egg-info/dependency_links.txt
+yaqa_quantization.egg-info/requires.txt
+yaqa_quantization.egg-info/top_level.txt

@@ -1,0 +1,197 @@
+#!/usr/bin/env python3
+"""
+Assemble the total block Hessian from saved per-layer files.
+
+The result is a block-banded symmetric matrix (bandwidth=1):
+
+    H[j,j]   = flat_to_sym(hin_j)      (n_j  × n_j)    from {name}_hin.pt
+    H[j,j+1] = cross_hin_j.T           (n_j  × n_{j+1}) from {name}_cross_hin.pt
+    H[j+1,j] = cross_hin_j             (n_{j+1} × n_j)
+
+Usage:
+    python assemble_total_hessian.py \\
+        --save_path /path/to/hessians \\
+        --hess_type in \\
+        --layers 0,1 \\
+        --names q,k,v,o,up,gate,down \\
+        --output total_hessian.pt
+
+If the assembled matrix is too large to store, use --stats_only to print
+block-level correlation statistics without materialising the full matrix.
+"""
+
+import argparse
+import os
+
+import torch
+import numpy as np
+
+
+# ── helpers ───────────────────────────────────────────────────────────────────
+
+def flat_to_sym(v: torch.Tensor, n: int) -> torch.Tensor:
+    A = torch.zeros(n, n, dtype=v.dtype)
+    idx = torch.tril_indices(n, n)
+    A[idx[0], idx[1]] = v
+    A[idx[1], idx[0]] = v
+    return A
+
+
+def infer_n(flat_len: int) -> int:
+    return int(round((-1 + (1 + 8 * flat_len) ** 0.5) / 2))
+
+
+def relative_strength(cross: torch.Tensor,
+                      diag_j: torch.Tensor,
+                      diag_k: torch.Tensor) -> float:
+    """Frobenius norm of cross block relative to geometric mean of diagonal blocks."""
+    denom = (diag_j.norm() * diag_k.norm()) ** 0.5
+    return (cross.norm() / denom).item() if denom > 0 else float('nan')
+
+
+def cosine_similarity_blocks(A: torch.Tensor, B: torch.Tensor) -> float:
+    return (A.flatten() @ B.flatten()
+            / (A.norm() * B.norm() + 1e-30)).item()
+
+
+# ── args ──────────────────────────────────────────────────────────────────────
+
+LAYER_ORDER = ['q', 'k', 'v', 'o', 'up', 'gate', 'down']
+
+parser = argparse.ArgumentParser()
+parser.add_argument('--save_path', required=True)
+parser.add_argument('--output', default='total_hessian.pt',
+                    help='Where to save the assembled matrix (.pt)')
+parser.add_argument('--hess_type', choices=['in', 'out'], default='in')
+parser.add_argument('--layers', default='0')
+parser.add_argument('--names', default=','.join(LAYER_ORDER))
+parser.add_argument('--stats_only', action='store_true',
+                    help='Print cross-block statistics without assembling the '
+                         'full matrix (saves memory)')
+parser.add_argument('--dtype', choices=['float32', 'float64'], default='float32')
+args = parser.parse_args()
+
+layer_nums = [int(x) for x in args.layers.split(',')]
+names      = [x.strip() for x in args.names.split(',')]
+dtype      = torch.float32 if args.dtype == 'float32' else torch.float64
+
+suffix_diag  = 'hin.pt'       if args.hess_type == 'in' else 'hout.pt'
+suffix_cross = 'cross_hin.pt' if args.hess_type == 'in' else 'cross_hout.pt'
+
+# ── discover layers ───────────────────────────────────────────────────────────
+
+entries = []
+for lb in sorted(layer_nums):
+    for nm in LAYER_ORDER:
+        if nm not in names:
+            continue
+        gidx  = lb * 7 + LAYER_ORDER.index(nm)
+        fdiag = os.path.join(args.save_path, f'{lb}_{nm}_{suffix_diag}')
+        fcross= os.path.join(args.save_path, f'{lb}_{nm}_{suffix_cross}')
+        if os.path.exists(fdiag):
+            entries.append({
+                'label':  f'{lb}_{nm}',
+                'gidx':   gidx,
+                'fdiag':  fdiag,
+                'fcross': fcross if os.path.exists(fcross) else None,
+            })
+
+if not entries:
+    raise SystemExit(f'[error] No files found in {args.save_path!r}')
+
+# ── load diagonal blocks ──────────────────────────────────────────────────────
+
+for e in entries:
+    v    = torch.load(e['fdiag'], map_location='cpu').to(dtype)
+    n    = infer_n(len(v))
+    e['n']    = n
+    e['diag'] = flat_to_sym(v, n)
+
+N      = len(entries)
+dims   = [e['n'] for e in entries]
+total  = sum(dims)
+labels = [e['label'] for e in entries]
+
+print(f'\nLayers ({N}): {labels}')
+print(f'Dims:        {dims}')
+print(f'Total dim:   {total}')
+
+# Memory estimate
+bytes_needed = total * total * (4 if dtype == torch.float32 else 8)
+print(f'Full matrix: {bytes_needed / 1e9:.2f} GB  '
+      f'({"float32" if dtype == torch.float32 else "float64"})\n')
+
+# ── load cross blocks & compute stats ─────────────────────────────────────────
+
+cross_blocks = {}   # key: (j, j+1) → tensor shape (n_{j+1}, n_j)
+
+print(f'{"Pair":>20}  {"shape":>15}  {"rel_strength":>14}  {"cos_sim":>10}')
+print('-' * 66)
+
+for j in range(N - 1):
+    ej = entries[j]
+    ek = entries[j + 1]
+
+    if ej['fcross'] is None or ek['gidx'] != ej['gidx'] + 1:
+        continue
+
+    C = torch.load(ej['fcross'], map_location='cpu').to(dtype)   # (n_k, n_j)
+
+    if C.shape != (ek['n'], ej['n']):
+        print(f'  [warn] {ej["label"]}→{ek["label"]}: '
+              f'shape {tuple(C.shape)} != ({ek["n"]},{ej["n"]}), skipping')
+        continue
+
+    rel = relative_strength(C, ej['diag'], ek['diag'])
+    cos = cosine_similarity_blocks(C.T, ej['diag'][:ek['n'], :ej['n']])
+
+    print(f'{ej["label"]:>12} ↔ {ek["label"]:<8}  '
+          f'{str(tuple(C.shape)):>15}  '
+          f'{rel:>14.4f}  '
+          f'{cos:>10.4f}')
+
+    cross_blocks[(j, j + 1)] = C   # (n_{j+1}, n_j)
+
+print()
+
+# ── assemble full block matrix ────────────────────────────────────────────────
+
+if args.stats_only:
+    print('[stats_only] Skipping full matrix assembly.')
+else:
+    print('Assembling full block matrix …')
+    H = torch.zeros(total, total, dtype=dtype)
+
+    offsets = [0]
+    for d in dims:
+        offsets.append(offsets[-1] + d)
+
+    # Diagonal blocks
+    for j, e in enumerate(entries):
+        oj = offsets[j]
+        H[oj:oj+e['n'], oj:oj+e['n']] = e['diag']
+
+    # Off-diagonal (adjacent) cross blocks
+    for (j, k), C in cross_blocks.items():
+        oj, ok = offsets[j], offsets[k]
+        nj, nk = dims[j], dims[k]
+        H[oj:oj+nj, ok:ok+nk] = C.T   # H[j, j+1]
+        H[ok:ok+nk, oj:oj+nj] = C     # H[j+1, j]
+
+    # Symmetry check
+    sym_err = (H - H.T).abs().max().item()
+    print(f'Symmetry error (max |H - H^T|): {sym_err:.3e}')
+
+    # Basic spectral info (only feasible for small matrices)
+    if total <= 4096:
+        eigvals = torch.linalg.eigvalsh(H)
+        print(f'Eigenvalue range:  [{eigvals.min().item():.3e}, '
+              f'{eigvals.max().item():.3e}]')
+        neg = (eigvals < 0).sum().item()
+        if neg:
+            print(f'[warn] {neg} negative eigenvalues '
+                  f'(cross terms may break PSD property)')
+
+    torch.save({'H': H, 'labels': labels, 'dims': dims, 'offsets': offsets},
+               args.output)
+    print(f'Saved → {args.output}  (shape {tuple(H.shape)})')

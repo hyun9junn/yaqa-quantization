@@ -6,6 +6,41 @@ For more details, see the paper.
 
 <img src="assets/comp.png" width="800">
 
+## Installation
+
+Requires Python ≥ 3.12 and a CUDA-capable GPU (CUDA 12.6 compatible driver).
+
+### 1 — Install core dependencies with uv
+
+```bash
+# Install uv if needed
+curl -LsSf https://astral.sh/uv/install.sh | sh
+
+# Create venv and install everything from the lockfile (exact versions)
+uv sync
+```
+
+`uv sync` reads `uv.lock` for a fully reproducible install.
+PyTorch wheels are pulled from the PyTorch CUDA 12.6 index automatically.
+
+### 2 — Build the local CUDA kernel (qtip-kernels)
+
+The `qtip-kernels` extension must be compiled against the torch that was just installed:
+
+```bash
+uv pip install -e ./qtip-kernels --no-build-isolation
+```
+
+This requires `nvcc` to be on `PATH` (provided by the CUDA toolkit).
+
+### 3 — Activate the environment
+
+```bash
+source .venv/bin/activate
+```
+
+---
+
 ## How to use this codebase
 
 This codebase is based off of the [QTIP](https://github.com/Cornell-RelaxML/qtip) codebase, with modifications made to support YAQA's quantization algorithm.
