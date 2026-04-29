@@ -8,35 +8,57 @@ For more details, see the paper.
 
 ## Installation
 
-Requires Python ≥ 3.12 and a CUDA-capable GPU (CUDA 12.6 compatible driver).
+Requires Python ≥ 3.12, a CUDA 12.6 compatible driver, and `nvcc` on `PATH`.
 
-### 1 — Install core dependencies with uv
+### 1 — Create the venv
 
 ```bash
 # Install uv if needed
 curl -LsSf https://astral.sh/uv/install.sh | sh
 
-# Create venv and install everything from the lockfile (exact versions)
-uv sync
+uv venv --python 3.12
+source .venv/bin/activate
 ```
 
-`uv sync` reads `uv.lock` for a fully reproducible install.
-PyTorch wheels are pulled from the PyTorch CUDA 12.6 index automatically.
+### 2 — Pre-seed build tools and torch
 
-### 2 — Build the local CUDA kernel (qtip-kernels)
+`fast-hadamard-transform` imports `torch` during metadata generation (before `uv sync`
+installs anything), so both must be present in `.venv` first.
 
-The `qtip-kernels` extension must be compiled against the torch that was just installed:
+`setuptools`/`wheel` must be installed separately from torch because `--index-url`
+replaces PyPI entirely and those packages are not on the PyTorch wheel index.
+
+```bash
+# Step A: build tools from PyPI
+uv pip install setuptools packaging wheel
+
+# Step B: torch from the CUDA 12.6 index
+# Use --reinstall if a wrong-CUDA torch is already present
+uv pip install "torch>=2.7.0" --index-url https://download.pytorch.org/whl/cu126
+```
+
+### 3 — Install all remaining dependencies
+
+```bash
+CUDA_HOME=/usr/local/cuda uv sync --no-build-isolation
+```
+
+`uv sync` reads `uv.lock` for a fully reproducible install and pulls PyTorch wheels
+from the CUDA 12.6 index automatically via `[tool.uv.sources]`.
+
+### 4 — Build the local CUDA kernel
 
 ```bash
 uv pip install -e ./qtip-kernels --no-build-isolation
 ```
 
-This requires `nvcc` to be on `PATH` (provided by the CUDA toolkit).
+### 5 — Log in to Hugging Face
 
-### 3 — Activate the environment
+Llama and other gated models require authentication:
 
 ```bash
-source .venv/bin/activate
+huggingface-cli login
+# or: export HF_TOKEN=your_token_here
 ```
 
 ---

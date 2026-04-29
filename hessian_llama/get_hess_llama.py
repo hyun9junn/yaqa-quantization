@@ -29,7 +29,18 @@ import argparse
 
 import tqdm
 from accelerate import init_empty_weights
-from lightning.pytorch.utilities.seed import isolate_rng
+from contextlib import contextmanager
+
+@contextmanager
+def isolate_rng():
+    cpu_state = torch.get_rng_state()
+    cuda_state = torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None
+    try:
+        yield
+    finally:
+        torch.set_rng_state(cpu_state)
+        if cuda_state is not None:
+            torch.cuda.set_rng_state_all(cuda_state)
 
 parser = argparse.ArgumentParser()
 parser.add_argument('--seed', default=42, type=int)
@@ -235,8 +246,8 @@ for pit in range(args.power_iters):
 
     if local_rank == 0:
         print(f'POWER ITERATION {pit}')
-        dataset = load_dataset('togethercomputer/RedPajama-Data-1T-Sample',
-                               split='train').shuffle(args.seed)
+        dataset = load_dataset('allenai/c4', 'en', split='train',
+                               streaming=True).shuffle(seed=args.seed, buffer_size=10000)
         dl = iter(
             torch.utils.data.DataLoader(
                 FullCtx(iter(dataset), tok, args.ctx_size),

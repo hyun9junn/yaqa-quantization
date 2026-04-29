@@ -13,7 +13,7 @@ requires-python = ">=3.12"
 dependencies = [
     # Core ML
     "torch>=2.7.0",
-    "transformers>=4.51.0",
+    "transformers>=4.51.0,<5.0",
     "accelerate>=1.6.0",
     "peft>=0.15.1",
     "safetensors>=0.5.3",
@@ -29,7 +29,7 @@ dependencies = [
     "numpy>=2.2.4",
     "scipy>=1.15.2",
     # CUDA / training utilities
-    "fast-hadamard-transform>=1.0.4",
+    "fast-hadamard-transform",
     "pytorch-lightning>=2.5.1",
     # Visualization
     "matplotlib>=3.10.1",
@@ -41,9 +41,19 @@ dependencies = [
 
 
 [tool.uv]
-# fast-hadamard-transform builds a CUDA extension but doesn't declare torch as
-# a build dependency — tell uv to inject it during the build.
-extra-build-dependencies = { fast-hadamard-transform = ["torch"] }
+# fast-hadamard-transform's setup.py imports torch at metadata-generation time
+# so torch must be present in .venv BEFORE uv sync runs.
+# setuptools/wheel must be installed separately: --index-url replaces PyPI entirely
+# and those packages are not on the PyTorch wheel index.
+#
+#   uv venv --python 3.12 && source .venv/bin/activate
+#   uv pip install setuptools packaging wheel
+#   uv pip install "torch>=2.7.0" --index-url https://download.pytorch.org/whl/cu126
+#   CUDA_HOME=/usr/local/cuda uv sync --no-build-isolation
+#   uv pip install -e ./qtip-kernels --no-build-isolation
+#
+# no-build-isolation lets fast-hadamard-transform see the torch already in .venv.
+no-build-isolation-package = ["fast-hadamard-transform"]
 
 # Packages that must come from the PyTorch CUDA wheel index
 override-dependencies = [
@@ -62,6 +72,7 @@ override-dependencies = [
 ]
 
 [tool.uv.sources]
+fast-hadamard-transform = { git = "https://github.com/Dao-AILab/fast-hadamard-transform.git", tag = "v1.0.4.post1" }
 torch = { index = "pytorch-cu126" }
 torchvision = { index = "pytorch-cu126" }
 torchaudio = { index = "pytorch-cu126" }

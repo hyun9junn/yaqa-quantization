@@ -18,7 +18,7 @@ Requires-Dist: lm-eval>=0.4.4
 Requires-Dist: aqlm>=1.1.7
 Requires-Dist: numpy>=2.2.4
 Requires-Dist: scipy>=1.15.2
-Requires-Dist: fast-hadamard-transform>=1.0.4
+Requires-Dist: fast-hadamard-transform
 Requires-Dist: pytorch-lightning>=2.5.1
 Requires-Dist: matplotlib>=3.10.1
 Requires-Dist: seaborn>=0.13.2

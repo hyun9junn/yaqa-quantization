@@ -1,7 +1,6 @@
 import random
 
 import torch
-from lightning.pytorch.utilities.seed import isolate_rng
 
 
 class DataLoader():
