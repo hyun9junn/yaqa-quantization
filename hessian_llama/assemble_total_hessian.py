@@ -50,6 +50,11 @@ def relative_strength(cross: torch.Tensor,
 
 
 def cosine_similarity_blocks(A: torch.Tensor, B: torch.Tensor) -> float:
+    """Cosine similarity between two matrices; truncates to min shape when sizes differ."""
+    if A.shape != B.shape:
+        m = min(A.shape[0], B.shape[0])
+        n = min(A.shape[1], B.shape[1])
+        A, B = A[:m, :n], B[:m, :n]
     return (A.flatten() @ B.flatten()
             / (A.norm() * B.norm() + 1e-30)).item()
 
@@ -143,7 +148,7 @@ for j in range(N - 1):
         continue
 
     rel = relative_strength(C, ej['diag'], ek['diag'])
-    cos = cosine_similarity_blocks(C.T, ej['diag'][:ek['n'], :ej['n']])
+    cos = cosine_similarity_blocks(C, ej['diag'][:ek['n'], :ej['n']])
 
     print(f'{ej["label"]:>12} ↔ {ek["label"]:<8}  '
           f'{str(tuple(C.shape)):>15}  '
@@ -151,6 +156,60 @@ for j in range(N - 1):
           f'{cos:>10.4f}')
 
     cross_blocks[(j, j + 1)] = C   # (n_{j+1}, n_j)
+
+print()
+
+# ── pairwise diagonal-block similarity grid ───────────────────────────────────
+
+print('Computing pairwise diagonal-block cosine similarities …')
+sim_matrix = torch.zeros(N, N)
+for i in range(N):
+    for j in range(N):
+        sim_matrix[i, j] = cosine_similarity_blocks(
+            entries[i]['diag'], entries[j]['diag'])
+
+# Print compact table
+col_w = max(len(lbl) for lbl in labels) + 2
+header = f'{"":>{col_w}}' + ''.join(f'{lbl:>{col_w}}' for lbl in labels)
+print(header)
+for i, lbl_i in enumerate(labels):
+    row = f'{lbl_i:>{col_w}}' + ''.join(
+        f'{sim_matrix[i, j].item():>{col_w}.3f}' for j in range(N))
+    print(row)
+print()
+
+# Save heatmap
+try:
+    import matplotlib
+    matplotlib.use('Agg')
+    import matplotlib.pyplot as plt
+
+    fig_size = max(8, N * 0.55 + 2)
+    fig, ax = plt.subplots(figsize=(fig_size, fig_size * 0.9))
+    im = ax.imshow(sim_matrix.numpy(), vmin=-1, vmax=1,
+                   cmap='RdBu_r', aspect='auto')
+    plt.colorbar(im, ax=ax, label='Cosine similarity', fraction=0.046, pad=0.04)
+    ax.set_xticks(range(N))
+    ax.set_yticks(range(N))
+    ax.set_xticklabels(labels, rotation=90, fontsize=8)
+    ax.set_yticklabels(labels, fontsize=8)
+    ax.set_title('Pairwise Hessian diagonal-block cosine similarity', pad=10)
+
+    if N <= 35:
+        for i in range(N):
+            for j in range(N):
+                val = sim_matrix[i, j].item()
+                color = 'white' if abs(val) > 0.55 else 'black'
+                ax.text(j, i, f'{val:.2f}', ha='center', va='center',
+                        fontsize=max(4, 7 - N // 8), color=color)
+
+    plt.tight_layout()
+    out_fig = os.path.join(args.save_path, 'hessian_similarity_grid.png')
+    plt.savefig(out_fig, dpi=150, bbox_inches='tight')
+    plt.close(fig)
+    print(f'Saved heatmap → {out_fig}')
+except ImportError:
+    print('[warn] matplotlib not available; skipping heatmap.')
 
 print()
 

@@ -1,14 +1,15 @@
-To collect Hessians for Llama 1, 2, and 3 models, run the `get_hess_llama.py` script with `torchrun`. 
-Parameters with `(WHATEVER FITS)` will need to be tuned by you depending on the size of your machine. 
+To collect Hessians for Llama 1, 2, and 3 models, run the `get_hess_llama.py` script with `torchrun`.
+Parameters with `(WHATEVER FITS)` will need to be tuned by you depending on the size of your machine.
 As a guide, we were able to fit models under ~20B parameters on a single 8x80G node and 70B across 2 8x80G nodes (layers 0 through 39 on one, 40 through 79 on another).
 This script processes layers independently so if you are on a cluster with a shared filesystem you can launch jobs in parallel across subsets of layers.
 We do not recommend using `cpu_offload` unless it is faster to move things to CPU on your machine than recomputing gradients.
-Accumulating in FP64 is not necessary but may give slight improvements in quantization performance. 
+Accumulating in FP64 is not necessary but may give slight improvements in quantization performance.
 The actual Hessian collection computation still happens in FP32 *per sample*, but if for some reason your model requires FP64 you may also want to change [the computation](https://github.com/Cornell-RelaxML/yaqa/blob/01763b16556031981b0d73ce2b802b56bfa1efea/hessian_llama/custom_linear_B.py#L61) to FP64 as well.
 We recommend using Sketch B if you can afford it.
 
 ## Sketch A
-```
+
+```bash
 torchrun --standalone --nproc-per-node=8 get_hess_llama.py \
     --save_path PATH \
     --orig_model HF_MODEL \
@@ -18,15 +19,15 @@ torchrun --standalone --nproc-per-node=8 get_hess_llama.py \
     --hessian_sketch A \
     --power_iters 6 \
     --ctx_size 8192 \
-    --n_seqs 4096 \
-    (OPTIONAL)
-    --fp64_accum (ACCUMULATE IN FP64) \
-    --cpu_offload (CPU OFFLOAD, USUALLY SLOWER THAN SPLITTING BY start_layer/end_layer)
+    --n_seqs 4096
+    # optional:
+    # --fp64_accum      (accumulate in FP64)
+    # --cpu_offload     (usually slower than splitting by start_layer/end_layer)
 ```
 
 ## Sketch B (Recommended)
 
-```
+```bash
 torchrun --standalone --nproc-per-node=8 get_hess_llama.py \
     --save_path PATH \
     --orig_model HF_MODEL \
@@ -36,10 +37,10 @@ torchrun --standalone --nproc-per-node=8 get_hess_llama.py \
     --hessian_sketch B \
     --power_iters 1 \
     --ctx_size 2048 \
-    --n_seqs 65536 \
-    (OPTIONAL)
-    --fp64_accum (ACCUMULATE IN FP64) \
-    --cpu_offload (CPU OFFLOAD, USUALLY SLOWER THAN SPLITTING BY start_layer/end_layer)
+    --n_seqs 65536
+    # optional:
+    # --fp64_accum      (accumulate in FP64)
+    # --cpu_offload     (usually slower than splitting by start_layer/end_layer)
 ```
 
 ---
@@ -47,7 +48,14 @@ torchrun --standalone --nproc-per-node=8 get_hess_llama.py \
 ## Cross-Layer Hessian
 
 The `--cross` flag additionally computes **off-diagonal cross terms** between adjacent linear layers,
-enabling analysis of how correlated the Hessian curvature is across layer boundaries.
+capturing how curvature is correlated across layer boundaries.
+Each cross term $H_{ij}$ is approximated as a Kronecker product $A_{ij} \otimes B_{ij}$,
+where $A_{ij} \in \mathbb{R}^{n_i \times n_j}$ (input space) and $B_{ij} \in \mathbb{R}^{m_i \times m_j}$ (output space).
+
+Both factors are estimated in a single backward pass from the weight gradient $L = G^T X$.
+When layers have different dimensions, a hybrid approach is used: exact computation when one pair of
+dimensions matches, rectangular truncation otherwise, followed by local alternating least squares (ALS)
+to refine the estimate. `--local_als_iters` controls how many ALS steps are taken (default 3).
 
 ### Output files
 
@@ -55,21 +63,18 @@ Running with `--cross` produces the following files under `--save_path` for each
 
 | File | Contents | Shape |
 |------|----------|-------|
-| `{block}_{proj}_hin.pt` | Input-space diagonal Hessian (flat lower-triangular) | `n*(n+1)/2` |
-| `{block}_{proj}_hout.pt` | Output-space diagonal Hessian (flat lower-triangular) | `m*(m+1)/2` |
-| `{block}_{proj}_cross_hin.pt` | Cross term between this layer and the next (by global index) | `(n_next, n)` |
-| `{block}_{proj}_cross_hout.pt` | Output-space cross term | `(m_next, m)` |
+| `{layer}_{proj}_hin.pt` | Input-space diagonal Hessian (flat lower-triangular) | `n*(n+1)/2` |
+| `{layer}_{proj}_hout.pt` | Output-space diagonal Hessian (flat lower-triangular) | `m*(m+1)/2` |
+| `{layer}_{proj}_cross{gidx}_hin.pt` | Input-space cross term with global layer `gidx` | `(n_other, n)` |
+| `{layer}_{proj}_cross{gidx}_hout.pt` | Output-space cross term with global layer `gidx` | `(m_other, m)` |
 
-where `{block}` is the transformer layer index (0, 1, 2, …) and `{proj}` is one of
+`{layer}` is the transformer block index (0, 1, 2, …) and `{proj}` is one of
 `q`, `k`, `v`, `o`, `up`, `gate`, `down`.
 
-The cross file stored at layer `j` holds `H[j+1, j]`, the off-diagonal block between
-layer `j+1` (rows) and layer `j` (columns). The full block matrix is symmetric:
-`H[j, j+1] = H[j+1, j].T`.
-
-The global layer order within each transformer block is: `q → k → v → o → up → gate → down`.
-Cross terms are computed between every pair of **globally adjacent** layers, so
-`0_down_cross_hin.pt` holds the cross term between layer 0's `down_proj` and layer 1's `q_proj`.
+The global layer order within each transformer block is: `q → k → v → o → up → gate → down`
+(global index = `block * 7 + position_in_block`).
+The cross file stored at layer `j` holds `H[j_other, j]`; the full block matrix is symmetric:
+`H[j, j_other] = H[j_other, j].T`.
 
 ### Step 1 — Collect Hessians with cross terms (Sketch B)
 
@@ -85,11 +90,13 @@ torchrun --standalone --nproc-per-node=8 get_hess_llama.py \
     --ctx_size 2048 \
     --n_seqs 65536 \
     --cross \
-    --align_mode rect
+    --local_als_iters 3
 ```
 
-`--align_mode` controls how cross-term dimensions are aligned when adjacent layers have
-different sizes (`rect` uses leading-identity truncation; `ortho` uses random orthonormal projections).
+`--local_als_iters N` controls ALS refinement steps for cross terms between layers with mismatched
+dimensions (e.g. q vs. down, which differ in both input and output size). More iterations give a
+better rank-1 Kronecker factorization of the cross term at modest extra cost. Set to 0 to disable ALS
+and use the raw truncated estimate.
 
 #### Single-GPU guide (e.g. 1× A100-40 GB, 125 GB CPU RAM)
 
@@ -105,7 +112,7 @@ Hessian accumulators simultaneously when `--cpu_offload` is set.
 | LLaMA-2-13B | ~26 GB | ~35 GB | ~61 GB | ✅ |
 | LLaMA-2-70B | ~140 GB | — | >125 GB | ❌ |
 
-> **`--cpu_offload` is required on a single GPU.**  Without it, Hessian accumulators
+> **`--cpu_offload` is required on a single GPU.** Without it, Hessian accumulators
 > for all linear layers (~22 GB for 7B) are allocated on the GPU card instead of CPU RAM.
 
 **LLaMA-2-7B / LLaMA-3-8B** (recommended):
@@ -123,7 +130,7 @@ torchrun --standalone --nproc-per-node=1 get_hess_llama.py \
     --ctx_size 2048 \
     --n_seqs 65536 \
     --cross \
-    --align_mode rect \
+    --local_als_iters 3 \
     --cpu_offload
 ```
 
@@ -142,7 +149,7 @@ torchrun --standalone --nproc-per-node=1 get_hess_llama.py \
     --ctx_size 2048 \
     --n_seqs 65536 \
     --cross \
-    --align_mode rect \
+    --local_als_iters 3 \
     --cpu_offload
 ```
 

@@ -56,7 +56,7 @@ parser.add_argument('--orig_model', type=str)
 parser.add_argument('--cpu_offload', action='store_true')
 parser.add_argument('--fp64_accum', action='store_true')
 parser.add_argument('--cross', action='store_true', default=False)
-parser.add_argument('--align_mode', choices=['ortho', 'rect'], default='rect')
+parser.add_argument('--local_als_iters', default=3, type=int)
 args = parser.parse_args()
 
 
@@ -264,7 +264,7 @@ for pit in range(args.power_iters):
 
         torch.distributed.scatter(batch, blist, src=0)
         logits = model(batch,
-                       mode=(pit, i == 0, i == (cutoff - 1), args.cross, args.align_mode),
+                       mode=(pit, i == 0, i == (cutoff - 1), args.cross, args.local_als_iters),
                        use_cache=False)['logits']
         logits = logits.view(-1, logits.shape[-1]).float()
 
@@ -287,13 +287,17 @@ for pit in range(args.power_iters):
                         l.hout / ct,
                         os.path.join(args.save_path, f'{l.fname}_hout.pt'))
                     
-                if hasattr(l, 'cross_hin') and l.cross_hin is not None:
-                    torch.save(
-                        l.cross_hin / ct,
-                        os.path.join(args.save_path, f'{l.fname}_cross_hin.pt'))
-                if hasattr(l, 'cross_hout') and l.cross_hout is not None:
-                    torch.save(
-                        l.cross_hout / ct,
-                        os.path.join(args.save_path, f'{l.fname}_cross_hout.pt'))
+                if hasattr(l, 'cross_hin'):
+                    for other_idx, tensor in l.cross_hin.items():
+                        torch.save(
+                            tensor / ct,
+                            os.path.join(args.save_path,
+                                         f'{l.fname}_cross{other_idx}_hin.pt'))
+                if hasattr(l, 'cross_hout'):
+                    for other_idx, tensor in l.cross_hout.items():
+                        torch.save(
+                            tensor / ct,
+                            os.path.join(args.save_path,
+                                         f'{l.fname}_cross{other_idx}_hout.pt'))
 
             print(f'RANK {local_rank} SAVED CURRENT HESSIANS')

@@ -43,7 +43,7 @@ class LinearNoBias(torch.autograd.Function):
     @staticmethod
     @torch.amp.custom_bwd(device_type='cuda')
     def backward(ctx, grad_output):
-        it, reset, div = ctx.mode
+        it, reset, div = ctx.mode[:3]
         is_buffer = local_rank == ctx.parent_class.buffer_dev
 
         input, weight = ctx.saved_tensors

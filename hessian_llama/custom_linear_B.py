@@ -12,24 +12,6 @@ local_world_size = int(os.environ.get("LOCAL_WORLD_SIZE", 1))
 
 from torch.distributed import ReduceOp
 
-def _rect_identity_aligners(dim_a: int, dim_b: int, device, dtype):
-
-    r = min(dim_a, dim_b)
-    A = torch.zeros(dim_a, r, device=device, dtype=dtype)
-    B = torch.zeros(dim_b, r, device=device, dtype=dtype)
-    A[:r, torch.arange(r)] = 1
-    B[:r, torch.arange(r)] = 1
-    return A, B, r
-
-def _orthonormal_aligners(dim_a: int, dim_b: int, device, dtype, seed: int = 0):
-
-    g = torch.Generator(device=device); g.manual_seed(seed)
-    r = min(dim_a, dim_b)
-    A_full = torch.randn(dim_a, r, generator=g, device=device, dtype=dtype)
-    B_full = torch.randn(dim_b, r, generator=g, device=device, dtype=dtype)
-    A, _ = torch.linalg.qr(A_full, mode='reduced')  # (dim_a, r)
-    B, _ = torch.linalg.qr(B_full, mode='reduced')  # (dim_b, r)
-    return A, B, r
 
 @torch.compile
 def sym_to_flat(A):
@@ -46,7 +28,9 @@ def flat_to_sym(V, N):
     A[idxs[1, :], idxs[0, :]] = V
     return A
 
-_LBUF = {}  # key: layer_idx -> Tensor L (cpu, shape: m_j x n_j)
+_LBUF = {}        # key: layer_idx -> (L, layer_name)
+_BATCH_ID  = [0]  # increments each backward pass
+_PAIRS_DONE = set()  # (i, j) pairs computed in current batch, i < j
 
 
 class LinearNoBias(torch.autograd.Function):
@@ -63,7 +47,7 @@ class LinearNoBias(torch.autograd.Function):
     @staticmethod
     @torch.amp.custom_bwd(device_type='cuda')
     def backward(ctx, grad_output):
-        it, reset, div, cross, align_mode = ctx.mode
+        it, reset, div, cross, n_als = ctx.mode
         is_buffer = local_rank == ctx.parent_class.buffer_dev
 
         input, weight = ctx.saved_tensors
@@ -80,10 +64,8 @@ class LinearNoBias(torch.autograd.Function):
                 if it == 0:
                     if reset and is_buffer:
                         ctx.parent_class.hin.mul_(0)
-                        if hasattr(ctx.parent_class, 'cross_hin') and ctx.parent_class.cross_hin is not None:
-                            ctx.parent_class.cross_hin.mul_(0)
-                        if hasattr(ctx.parent_class, 'cross_hout') and ctx.parent_class.cross_hout is not None:
-                            ctx.parent_class.cross_hout.mul_(0)
+                        ctx.parent_class.cross_hin.clear()
+                        ctx.parent_class.cross_hout.clear()
 
                     grad_output = grad_output.float()
                     input = input.float()
@@ -120,6 +102,10 @@ class LinearNoBias(torch.autograd.Function):
                         if div:
                             ctx.parent_class.hin.div_(ctx.parent_class.ct)
                             ctx.parent_class.hout.div_(ctx.parent_class.ct)
+                            for t in ctx.parent_class.cross_hin.values():
+                                t.div_(ctx.parent_class.ct)
+                            for t in ctx.parent_class.cross_hout.values():
+                                t.div_(ctx.parent_class.ct)
                             ctx.parent_class.ct = 0
 
                     del in_hess, out_hess
@@ -127,67 +113,88 @@ class LinearNoBias(torch.autograd.Function):
 
                     if cross:
 
-                        # --- Cross-layer (band w=1): match with neighbor i = j+1 ---
-                        # Store my L to per-process CPU buffer
+                        # If this layer already has an entry, the previous entry is stale
+                        # (same layer can only appear once per backward pass).
+                        if layer_idx in _LBUF:
+                            _BATCH_ID[0] += 1
+                            _LBUF.clear()
+                            _PAIRS_DONE.clear()
+
                         _LBUF[layer_idx] = (l_grad.detach().cpu(), ctx.parent_class.layer_name)
 
-                        # If neighbor's L is already there, form cross terms and pop
-                        if (layer_idx + 1) in _LBUF:
-                            Li, Li_name = _LBUF.pop(layer_idx + 1)  # i = j+1
+                        # Compute cross with every other layer currently in the buffer.
+                        # Use _PAIRS_DONE to ensure each pair is computed exactly once.
+                        # This handles non-monotonic backward orders (e.g. SwiGLU: down→up→gate).
+                        Lj = l_grad
+                        devI = 'cpu' if ctx.parent_class.hin.device.type == 'cpu' else ctx.parent_class.buffer_dev
+                        devO = 'cpu' if ctx.parent_class.hout.device.type == 'cpu' else ctx.parent_class.buffer_dev
 
-                            SKIP = ['q']
-                            if Li_name in SKIP:
-                                del Li
-                                pass
+                        for other_idx in list(_LBUF.keys()):
+                            if other_idx == layer_idx:
+                                continue
+                            pair_key = (min(layer_idx, other_idx),
+                                        max(layer_idx, other_idx))
+                            if pair_key in _PAIRS_DONE:
+                                continue
+
+                            Li, Li_name = _LBUF[other_idx]
+
+                            Li = Li.to(Lj.device, non_blocking=True).to(Lj.dtype)
+
+                            m_i, n_i = Li.shape
+                            m_j, n_j = Lj.shape
+
+                            # Hybrid init: exact when dims match, rect truncation otherwise
+                            if m_i == m_j:
+                                cross_in_hess = (Li.T @ Lj / m_i).to(op_dtype).to(local_rank)
                             else:
+                                r_m = min(m_i, m_j)
+                                cross_in_hess = (Li[:r_m].T @ Lj[:r_m] / r_m).to(op_dtype).to(local_rank)
 
-                                Lj = l_grad                     # j = current
-                                Li = Li.to(Lj.device, non_blocking=True).to(Lj.dtype)
+                            if n_i == n_j:
+                                cross_out_hess = (Li @ Lj.T / n_i).to(op_dtype).to(local_rank)
+                            else:
+                                r_n = min(n_i, n_j)
+                                cross_out_hess = (Li[:, :r_n] @ Lj[:, :r_n].T / r_n).to(op_dtype).to(local_rank)
 
-                                m_i, n_i = Li.shape
-                                m_j, n_j = Lj.shape
-                                if align_mode == 'rect':
-                                    A_i, A_j, r_m = _rect_identity_aligners(m_i, m_j, Lj.device, Lj.dtype)
-                                    B_i, B_j, r_n = _rect_identity_aligners(n_i, n_j, Lj.device, Lj.dtype)
-                                else:
-                                    A_i, A_j, r_m = _orthonormal_aligners(m_i, m_j, Lj.device, Lj.dtype, seed=1234)
-                                    B_i, B_j, r_n = _orthonormal_aligners(n_i, n_j, Lj.device, Lj.dtype, seed=5678)
+                            # Local ALS for unequal-dim pairs
+                            if (m_i != m_j or n_i != n_j) and n_als > 0:
+                                H_I = cross_in_hess.float()
+                                H_O = cross_out_hess.float()
+                                Li_f, Lj_f = Li.float(), Lj.float()
+                                for _ in range(n_als):
+                                    norm_O = H_O.norm()
+                                    if norm_O > 0:
+                                        H_I = Li_f.T @ H_O @ Lj_f / (norm_O ** 2)
+                                    norm_I = H_I.norm()
+                                    if norm_I > 0:
+                                        H_O = Li_f @ H_I @ Lj_f.T / (norm_I ** 2)
+                                cross_in_hess  = H_I.to(op_dtype)
+                                cross_out_hess = H_O.to(op_dtype)
+                                del H_I, H_O, Li_f, Lj_f
 
-                                Li_m = A_i.T @ Li        # (r_m, n_i)
-                                Lj_m = A_j.T @ Lj        # (r_m, n_j)
-                                cross_in_hess  = (Li_m.T @ Lj_m).to(op_dtype).to(local_rank)   # (n_i, n_j)
+                            torch.distributed.reduce(cross_in_hess,  ctx.parent_class.buffer_dev, op=ReduceOp.AVG)
+                            torch.distributed.reduce(cross_out_hess, ctx.parent_class.buffer_dev, op=ReduceOp.AVG)
 
-                                Li_n = Li @ B_i          # (m_i, r_n)
-                                Lj_n = Lj @ B_j          # (m_j, r_n)
-                                cross_out_hess = (Li_n @ Lj_n.T).to(op_dtype).to(local_rank)   # (m_i, m_j)
+                            if is_buffer:
+                                if other_idx not in ctx.parent_class.cross_hin or \
+                                        ctx.parent_class.cross_hin[other_idx].shape != cross_in_hess.shape:
+                                    ctx.parent_class.cross_hin[other_idx] = torch.zeros_like(
+                                        cross_in_hess, device=devI, dtype=op_dtype)
+                                if other_idx not in ctx.parent_class.cross_hout or \
+                                        ctx.parent_class.cross_hout[other_idx].shape != cross_out_hess.shape:
+                                    ctx.parent_class.cross_hout[other_idx] = torch.zeros_like(
+                                        cross_out_hess, device=devO, dtype=op_dtype)
 
-                                cross_in_hess  /= r_m  # m_j
-                                cross_out_hess /= r_n  # n_j
+                                ctx.parent_class.cross_hin[other_idx].add_(
+                                    cross_in_hess.to(devI))
+                                ctx.parent_class.cross_hout[other_idx].add_(
+                                    cross_out_hess.to(devO))
 
-                                torch.distributed.reduce(cross_in_hess,  ctx.parent_class.buffer_dev, op=ReduceOp.AVG)
-                                torch.distributed.reduce(cross_out_hess, ctx.parent_class.buffer_dev, op=ReduceOp.AVG)
-
-                                if is_buffer:
-                                    # allocate accumulators on first use
-                                    if not hasattr(ctx.parent_class, 'cross_hin') or \
-                                    ctx.parent_class.cross_hin is None or \
-                                    ctx.parent_class.cross_hin.shape != cross_in_hess.shape:
-                                        devI = 'cpu' if ctx.parent_class.hin.device.type == 'cpu' else ctx.parent_class.buffer_dev
-                                        ctx.parent_class.cross_hin = torch.zeros_like(cross_in_hess, device=devI, dtype=op_dtype)
-                                    if not hasattr(ctx.parent_class, 'cross_hout') or \
-                                    ctx.parent_class.cross_hout is None or \
-                                    ctx.parent_class.cross_hout.shape != cross_out_hess.shape:
-                                        devO = 'cpu' if ctx.parent_class.hout.device.type == 'cpu' else ctx.parent_class.buffer_dev
-                                        ctx.parent_class.cross_hout = torch.zeros_like(cross_out_hess, device=devO, dtype=op_dtype)
-
-                                    ctx.parent_class.cross_hin.add_(cross_in_hess.to(ctx.parent_class.cross_hin.device))
-                                    ctx.parent_class.cross_hout.add_(cross_out_hess.to(ctx.parent_class.cross_hout.device))
-
-                                del Li_m, Lj_m, Li_n, Lj_n
-                                del A_i, A_j, B_i, B_j
-                                del cross_in_hess, cross_out_hess
-                                del Li, Lj
-                                torch.cuda.empty_cache()
+                            _PAIRS_DONE.add(pair_key)
+                            del cross_in_hess, cross_out_hess
+                            del Li
+                            torch.cuda.empty_cache()
 
                     del l_grad
                     torch.cuda.empty_cache()
@@ -244,29 +251,13 @@ class CustomLinear(nn.Linear):
                                         dtype=self.op_dtype,
                                         device=device)
                 
-            last_it = sorted(glob.glob(f'{load_fname}_cross_hin*.pt'))
-            if len(last_it) > 0 and os.path.exists(last_it[-1]):
-                self.cross_hin = torch.load(last_it[-1],
-                                           map_location=torch.device(device)).to(
-                                               self.op_dtype)
-            else:
-                self.cross_hin = None
-            
-            last_it = sorted(glob.glob(f'{load_fname}_cross_hout*.pt'))
-            if len(last_it) > 0 and os.path.exists(last_it[-1]):
-                self.cross_hout = torch.load(last_it[-1],
-                                            map_location=torch.device(device)).to(
-                                                self.op_dtype)
-            else:
-                self.cross_hout = None
+            # cross_hin / cross_hout: dict keyed by partner gidx → tensor
+            self.cross_hin  = {}
+            self.cross_hout = {}
 
             if cpu_offload:
                 self.hin.pin_memory()
                 self.hout.pin_memory()
-                if self.cross_hin is not None:
-                    self.cross_hin.pin_memory()
-                if self.cross_hout is not None:
-                    self.cross_hout.pin_memory()
 
         self.buffer_dev = buffer_dev
         self.ct = 0
