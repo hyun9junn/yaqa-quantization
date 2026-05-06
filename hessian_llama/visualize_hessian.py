@@ -20,6 +20,7 @@ Usage example:
 """
 
 import argparse
+import glob
 import os
 
 import matplotlib
@@ -76,13 +77,16 @@ parser.add_argument('--log_scale', action='store_true',
 parser.add_argument('--normalize_diag', action='store_true',
                     help='Scale each block so its diagonal block peak = 1 '
                          '(makes cross-term strength directly comparable)')
+parser.add_argument('--all_cross', action='store_true',
+                    help='Show all pairwise cross-block terms, not just adjacent (w=1). '
+                         'Requires cross data to have been collected for non-adjacent pairs.')
 args = parser.parse_args()
 
 layer_nums = [int(x) for x in args.layers.split(',')]
 names      = [x.strip() for x in args.names.split(',')]
 
 suffix_diag  = 'hin.pt'       if args.hess_type == 'in' else 'hout.pt'
-suffix_cross = 'cross_hin.pt' if args.hess_type == 'in' else 'cross_hout.pt'
+suffix_cross = 'hin.pt'       if args.hess_type == 'in' else 'hout.pt'
 
 # ── discover files ────────────────────────────────────────────────────────────
 
@@ -91,15 +95,25 @@ for lb in sorted(layer_nums):
     for nm in LAYER_ORDER:
         if nm not in names:
             continue
-        gidx   = lb * 7 + LAYER_ORDER.index(nm)
-        fdiag  = os.path.join(args.save_path, f'{lb}_{nm}_{suffix_diag}')
-        fcross = os.path.join(args.save_path, f'{lb}_{nm}_{suffix_cross}')
+        gidx  = lb * 7 + LAYER_ORDER.index(nm)
+        fdiag = os.path.join(args.save_path, f'{lb}_{nm}_{suffix_diag}')
         if os.path.exists(fdiag):
+            # cross files are named {label}_cross{partner_gidx}_{suffix}
+            cross_map = {}  # partner_gidx → filepath
+            for fp in glob.glob(os.path.join(args.save_path,
+                                             f'{lb}_{nm}_cross*_{suffix_cross}')):
+                basename = os.path.basename(fp)
+                mid = basename[len(f'{lb}_{nm}_cross'):]
+                gidx_str = mid[:mid.index('_')]
+                try:
+                    cross_map[int(gidx_str)] = fp
+                except ValueError:
+                    pass
             entries.append({
-                'label':  f'{lb}_{nm}',
-                'gidx':   gidx,
-                'fdiag':  fdiag,
-                'fcross': fcross if os.path.exists(fcross) else None,
+                'label':     f'{lb}_{nm}',
+                'gidx':      gidx,
+                'fdiag':     fdiag,
+                'cross_map': cross_map,
             })
 
 if not entries:
@@ -145,43 +159,49 @@ for j, e in enumerate(entries):
 
 # ── fill cross blocks ─────────────────────────────────────────────────────────
 
+# Build candidate pairs: all (j<k) when --all_cross, adjacent-only otherwise
+if args.all_cross:
+    pairs = [(j, k) for j in range(N) for k in range(j + 1, N)]
+else:
+    # Only pairs whose gidx differ by exactly 1 (bandwidth w=1)
+    pairs = [(j, j + 1) for j in range(N - 1)
+             if entries[j + 1]['gidx'] == entries[j]['gidx'] + 1]
+
 cross_found = 0
-for j in range(N - 1):
+for j, k in pairs:
     ej = entries[j]
-    ek = entries[j + 1]
+    ek = entries[k]
 
-    if ej['fcross'] is None:
-        continue
-    # Only wire up genuinely adjacent layers (gidx differing by 1)
-    if ek['gidx'] != ej['gidx'] + 1:
-        print(f'  [skip cross] {ej["label"]} gidx={ej["gidx"]} and '
-              f'{ek["label"]} gidx={ek["gidx"]} are not adjacent')
+    # cross data is stored at the lower-gidx layer keyed by partner gidx
+    fcross = ej['cross_map'].get(ek['gidx'])
+    if fcross is None:
         continue
 
-    C = torch.load(ej['fcross'], map_location='cpu').float().numpy()
-    # Expected shape: (n_{j+1}, n_j)
+    C = torch.load(fcross, map_location='cpu').float().numpy()
+    # Expected shape: (n_k, n_j)
     if C.shape != (ek['n'], ej['n']):
         print(f'  [warn] cross shape {C.shape} != expected ({ek["n"]},{ej["n"]}) '
               f'for {ej["label"]}→{ek["label"]}, skipping')
         continue
 
-    sj, sk = sizes[j], sizes[j + 1]
-    oj, ok = offsets[j], offsets[j + 1]
+    sj, sk = sizes[j], sizes[k]
+    oj, ok = offsets[j], offsets[k]
 
-    # H[j, j+1] = C.T  shape (n_j, n_{j+1}) → downsample to (sj, sk)
+    # H[j, k] = C.T  shape (n_j, n_k) → downsample to (sj, sk)
     Ct_ds = downsample(C.T, sj, sk)
-    # H[j+1, j] = C    shape (n_{j+1}, n_j) → downsample to (sk, sj)
+    # H[k, j] = C    shape (n_k, n_j) → downsample to (sk, sj)
     C_ds  = downsample(C,   sk, sj)
 
     if args.normalize_diag:
-        scale = (diag_peaks[j] * diag_peaks[j + 1]) ** 0.5
+        scale = (diag_peaks[j] * diag_peaks[k]) ** 0.5
         Ct_ds = Ct_ds / scale
         C_ds  = C_ds  / scale
 
-    mosaic[oj:oj+sj, ok:ok+sk] = Ct_ds   # upper-right block  H[j, j+1]
-    mosaic[ok:ok+sk, oj:oj+sj] = C_ds    # lower-left  block  H[j+1, j]
+    mosaic[oj:oj+sj, ok:ok+sk] = Ct_ds   # upper-right block H[j, k]
+    mosaic[ok:ok+sk, oj:oj+sj] = C_ds    # lower-left  block H[k, j]
     cross_found += 1
-    print(f'  cross {ej["label"]}↔{ek["label"]:12s}  '
+    gap = ek['gidx'] - ej['gidx']
+    print(f'  cross {ej["label"]}↔{ek["label"]:12s}  gap={gap:2d}  '
           f'raw_range=[{C.min():.3e}, {C.max():.3e}]')
 
 if cross_found == 0:
@@ -223,11 +243,12 @@ for off in offsets[1:-1]:
     ax.axhline(off - 0.5, color='k', lw=0.4, alpha=0.5)
     ax.axvline(off - 0.5, color='k', lw=0.4, alpha=0.5)
 
-hname = 'H_in (input-space)' if args.hess_type == 'in' else 'H_out (output-space)'
-norm_tag = ', diag-normalized' if args.normalize_diag else ''
-log_tag  = ', log-scale'       if args.log_scale      else ''
+hname    = 'H_in (input-space)' if args.hess_type == 'in' else 'H_out (output-space)'
+norm_tag = ', diag-normalized'  if args.normalize_diag else ''
+log_tag  = ', log-scale'        if args.log_scale      else ''
+cross_tag = ', all-pairs cross' if args.all_cross      else ', adjacent cross (w=1)'
 ax.set_title(
-    f'Block Hessian  {hname}{norm_tag}{log_tag}\n'
+    f'Block Hessian  {hname}{norm_tag}{log_tag}{cross_tag}\n'
     f'layers={args.layers}  |  projs={args.names}',
     fontsize=9)
 

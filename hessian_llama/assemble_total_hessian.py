@@ -5,7 +5,7 @@ Assemble the total block Hessian from saved per-layer files.
 The result is a block-banded symmetric matrix (bandwidth=1):
 
     H[j,j]   = flat_to_sym(hin_j)      (n_j  × n_j)    from {name}_hin.pt
-    H[j,j+1] = cross_hin_j.T           (n_j  × n_{j+1}) from {name}_cross_hin.pt
+    H[j,j+1] = cross_hin_j.T           (n_j  × n_{j+1}) from {name}_cross{gidx}_hin.pt
     H[j+1,j] = cross_hin_j             (n_{j+1} × n_j)
 
 Usage:
@@ -21,6 +21,7 @@ block-level correlation statistics without materialising the full matrix.
 """
 
 import argparse
+import glob
 import os
 
 import torch
@@ -80,8 +81,8 @@ layer_nums = [int(x) for x in args.layers.split(',')]
 names      = [x.strip() for x in args.names.split(',')]
 dtype      = torch.float32 if args.dtype == 'float32' else torch.float64
 
-suffix_diag  = 'hin.pt'       if args.hess_type == 'in' else 'hout.pt'
-suffix_cross = 'cross_hin.pt' if args.hess_type == 'in' else 'cross_hout.pt'
+suffix_diag  = 'hin.pt' if args.hess_type == 'in' else 'hout.pt'
+suffix_cross = 'hin.pt' if args.hess_type == 'in' else 'hout.pt'
 
 # ── discover layers ───────────────────────────────────────────────────────────
 
@@ -92,13 +93,23 @@ for lb in sorted(layer_nums):
             continue
         gidx  = lb * 7 + LAYER_ORDER.index(nm)
         fdiag = os.path.join(args.save_path, f'{lb}_{nm}_{suffix_diag}')
-        fcross= os.path.join(args.save_path, f'{lb}_{nm}_{suffix_cross}')
         if os.path.exists(fdiag):
+            # cross files: {label}_cross{partner_gidx}_{suffix}
+            cross_map = {}
+            for fp in glob.glob(os.path.join(args.save_path,
+                                             f'{lb}_{nm}_cross*_{suffix_cross}')):
+                basename = os.path.basename(fp)
+                mid = basename[len(f'{lb}_{nm}_cross'):]
+                gidx_str = mid[:mid.index('_')]
+                try:
+                    cross_map[int(gidx_str)] = fp
+                except ValueError:
+                    pass
             entries.append({
-                'label':  f'{lb}_{nm}',
-                'gidx':   gidx,
-                'fdiag':  fdiag,
-                'fcross': fcross if os.path.exists(fcross) else None,
+                'label':     f'{lb}_{nm}',
+                'gidx':      gidx,
+                'fdiag':     fdiag,
+                'cross_map': cross_map,
             })
 
 if not entries:
@@ -137,10 +148,14 @@ for j in range(N - 1):
     ej = entries[j]
     ek = entries[j + 1]
 
-    if ej['fcross'] is None or ek['gidx'] != ej['gidx'] + 1:
+    if ek['gidx'] != ej['gidx'] + 1:
         continue
 
-    C = torch.load(ej['fcross'], map_location='cpu').to(dtype)   # (n_k, n_j)
+    fcross = ej['cross_map'].get(ek['gidx'])
+    if fcross is None:
+        continue
+
+    C = torch.load(fcross, map_location='cpu').to(dtype)   # (n_k, n_j)
 
     if C.shape != (ek['n'], ej['n']):
         print(f'  [warn] {ej["label"]}→{ek["label"]}: '

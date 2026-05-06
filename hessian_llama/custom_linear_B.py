@@ -161,14 +161,28 @@ class LinearNoBias(torch.autograd.Function):
                             if (m_i != m_j or n_i != n_j) and n_als > 0:
                                 H_I = cross_in_hess.float()
                                 H_O = cross_out_hess.float()
-                                Li_f, Lj_f = Li.float(), Lj.float()
+                                # Normalise L matrices to unit Frobenius norm before ALS.
+                                # Without this, ||Li||·||Lj|| ~ 10^9 causes the alternating
+                                # updates to explode in O(||Li||^2·||Lj||^2) steps.
+                                # We restore the initial-estimate scale after convergence.
+                                Li_scale = Li.float().norm().clamp(min=1e-30)
+                                Lj_scale = Lj.float().norm().clamp(min=1e-30)
+                                Li_f = Li.float() / Li_scale
+                                Lj_f = Lj.float() / Lj_scale
+                                H_I_init_norm = H_I.norm().clamp(min=1e-30)
+                                H_O_init_norm = H_O.norm().clamp(min=1e-30)
+                                H_I = H_I / H_I_init_norm
+                                H_O = H_O / H_O_init_norm
                                 for _ in range(n_als):
                                     norm_O = H_O.norm()
-                                    if norm_O > 0:
+                                    if norm_O > 1e-30:
                                         H_I = Li_f.T @ H_O @ Lj_f / (norm_O ** 2)
                                     norm_I = H_I.norm()
-                                    if norm_I > 0:
+                                    if norm_I > 1e-30:
                                         H_O = Li_f @ H_I @ Lj_f.T / (norm_I ** 2)
+                                # Restore scale: preserve direction from ALS, magnitude from truncated estimate
+                                H_I = H_I * (H_I_init_norm / H_I.norm().clamp(min=1e-30))
+                                H_O = H_O * (H_O_init_norm / H_O.norm().clamp(min=1e-30))
                                 cross_in_hess  = H_I.to(op_dtype)
                                 cross_out_hess = H_O.to(op_dtype)
                                 del H_I, H_O, Li_f, Lj_f
