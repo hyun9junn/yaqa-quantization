@@ -169,10 +169,8 @@ class LinearNoBias(torch.autograd.Function):
                                 Lj_scale = Lj.float().norm().clamp(min=1e-30)
                                 Li_f = Li.float() / Li_scale
                                 Lj_f = Lj.float() / Lj_scale
-                                H_I_init_norm = H_I.norm().clamp(min=1e-30)
-                                H_O_init_norm = H_O.norm().clamp(min=1e-30)
-                                H_I = H_I / H_I_init_norm
-                                H_O = H_O / H_O_init_norm
+                                H_I = H_I / H_I.norm().clamp(min=1e-30)
+                                H_O = H_O / H_O.norm().clamp(min=1e-30)
                                 for _ in range(n_als):
                                     norm_O = H_O.norm()
                                     if norm_O > 1e-30:
@@ -180,12 +178,19 @@ class LinearNoBias(torch.autograd.Function):
                                     norm_I = H_I.norm()
                                     if norm_I > 1e-30:
                                         H_O = Li_f @ H_I @ Lj_f.T / (norm_I ** 2)
-                                # Restore scale: preserve direction from ALS, magnitude from truncated estimate
-                                H_I = H_I * (H_I_init_norm / H_I.norm().clamp(min=1e-30))
-                                H_O = H_O * (H_O_init_norm / H_O.norm().clamp(min=1e-30))
-                                cross_in_hess  = H_I.to(op_dtype)
-                                cross_out_hess = H_O.to(op_dtype)
-                                del H_I, H_O, Li_f, Lj_f
+                                # Full-gradient scale: ALS gives direction; recompute magnitude
+                                # using ALL rows/cols of L (no truncation bias).
+                                # Geometric-mean dim normalisation reduces to /m when m_i == m_j,
+                                # consistent with the equal-dim convention.
+                                H_I_dir = H_I / H_I.norm().clamp(min=1e-30)
+                                H_O_dir = H_O / H_O.norm().clamp(min=1e-30)
+                                scale_I = (Li_f.T @ H_O_dir @ Lj_f).norm()  # n_i × n_j, all m rows
+                                scale_O = (Li_f @ H_I_dir @ Lj_f.T).norm()  # m_i × m_j, all n cols
+                                m_eff = (m_i * m_j) ** 0.5
+                                n_eff = (n_i * n_j) ** 0.5
+                                cross_in_hess  = (H_I_dir * (scale_I * Li_scale * Lj_scale / m_eff)).to(op_dtype)
+                                cross_out_hess = (H_O_dir * (scale_O * Li_scale * Lj_scale / n_eff)).to(op_dtype)
+                                del H_I, H_O, H_I_dir, H_O_dir, Li_f, Lj_f
 
                             torch.distributed.reduce(cross_in_hess,  ctx.parent_class.buffer_dev, op=ReduceOp.AVG)
                             torch.distributed.reduce(cross_out_hess, ctx.parent_class.buffer_dev, op=ReduceOp.AVG)

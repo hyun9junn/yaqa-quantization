@@ -172,15 +172,6 @@ for j, ej in enumerate(entries):
             print(f'  [warn] H_I shape mismatch for {ej["label"]}→{ek["label"]}, skipping')
             continue
 
-        # ALS runs during collection when m_i != m_j or n_i != n_j.
-        # Until the ALS fix is applied and data re-collected, those estimates
-        # are unreliable (values ~10^12).  Mark them NaN in the plot.
-        als_ran = (ej['m_out'] != ek['m_out'] or ej['n_in'] != ek['n_in'])
-        if als_ran:
-            print(f'{ej["label"]:>12} ↔ {ek["label"]:<8}  '
-                  f'{"[ALS — re-collect]":>32}')
-            continue
-
         # rho_I: hin stores L^T L (no /m); correct by dividing hin by m_out
         rI = float('nan')
         if ej['m_out'] is not None and ek['m_out'] is not None:
@@ -275,7 +266,7 @@ for ax, data, title in panels:
 plt.suptitle(
     'Cross-Hessian significance: ρᴵ, ρᴼ, and combined ρᴵ×ρᴼ\n'
     '||H_{jk}||_F / √(||H_{jj}||·||H_{kk}||)  where  H_{jj}=(hin_j/m_j)⊗(hout_j/n_j)\n'
-    'Gray = no cross data   |   ALS-affected pairs (m_i≠m_j) may be unreliable',
+    'Gray = no cross data   |   ALS-refined pairs (m_i≠m_j) use geometric-mean normalisation',
     fontsize=10, y=1.02)
 plt.tight_layout()
 

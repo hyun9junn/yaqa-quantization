@@ -140,7 +140,7 @@ Add `--cross` to also collect all pairwise cross-block terms.
 ```bash
 # Single GPU, 7B model, all layers, with cross terms
 torchrun --standalone --nproc-per-node=1 get_hess_llama.py \
-    --save_path ./hess_als0 \
+    --save_path ./hess_als3_after \
     --orig_model meta-llama/Llama-2-7b-hf \
     --batch_size 16 \
     --start_layer 0 \
@@ -150,7 +150,7 @@ torchrun --standalone --nproc-per-node=1 get_hess_llama.py \
     --ctx_size 2048 \
     --n_seqs 2048 \
     --cross \
-    --local_als_iters 0 \
+    --local_als_iters 3 \
     --cpu_offload
 ```
 
@@ -250,7 +250,7 @@ a three-panel heatmap.
 
 ```bash
 python visualize_cross_coupling.py \
-    --save_path /path/to/hessians \
+    --save_path ./hess_als3_after \
     --layers 0,1,2 \
     --names q,k,v,o,up,gate,down
 ```
