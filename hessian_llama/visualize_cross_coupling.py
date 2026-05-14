@@ -21,8 +21,12 @@ Three panels are shown:
 Usage:
     python visualize_cross_coupling.py \\
         --save_path ./hess \\
-        --layers 0,1,2 \\
         --names q,k,v,o,up,gate,down
+
+    # Optional: restrict to a subset
+    python visualize_cross_coupling.py \\
+        --save_path ./hess \\
+        --layers 0,1,2
 """
 
 import argparse
@@ -83,18 +87,44 @@ def load_cross_map(save_path: str, label: str, suffix: str) -> dict:
     return cross_map
 
 
+def discover_layers(save_path: str, names: list):
+    """Infer available transformer blocks from diagonal hin files."""
+    layers = set()
+    valid_names = set(names)
+    for fp in glob.glob(os.path.join(save_path, '*_hin.pt')):
+        stem = os.path.basename(fp)[:-len('_hin.pt')]
+        try:
+            lb_str, nm = stem.split('_', 1)
+            lb = int(lb_str)
+        except ValueError:
+            continue
+        if nm in valid_names:
+            layers.add(lb)
+    return sorted(layers)
+
+
 # ── args ──────────────────────────────────────────────────────────────────────
 
 parser = argparse.ArgumentParser()
 parser.add_argument('--save_path', required=True)
-parser.add_argument('--layers', default='0')
+parser.add_argument('--layers', default='all',
+                    help='Comma-separated transformer block indices, or "all" to infer every saved layer')
 parser.add_argument('--names', default=','.join(LAYER_ORDER))
 parser.add_argument('--dtype', choices=['float32', 'float64'], default='float32')
+parser.add_argument('--dpi', type=int, default=300,
+                    help='DPI for saved PNG output')
 args = parser.parse_args()
 
-layer_nums = [int(x) for x in args.layers.split(',')]
 names      = [x.strip() for x in args.names.split(',')]
 dtype      = torch.float32 if args.dtype == 'float32' else torch.float64
+
+if args.layers.lower() == 'all':
+    layer_nums = discover_layers(args.save_path, names)
+else:
+    layer_nums = [int(x) for x in args.layers.split(',') if x.strip()]
+
+if not layer_nums:
+    raise SystemExit(f'[error] No layers found in {args.save_path!r} for names={args.names}')
 
 # ── discover & load diagonal blocks (both H_I and H_O) ───────────────────────
 
@@ -271,6 +301,9 @@ plt.suptitle(
 plt.tight_layout()
 
 out_fig = os.path.join(args.save_path, 'cross_hessian_grid.png')
-plt.savefig(out_fig, dpi=150, bbox_inches='tight')
+plt.savefig(out_fig, dpi=args.dpi, bbox_inches='tight')
+out_pdf = os.path.join(args.save_path, 'cross_hessian_grid.pdf')
+plt.savefig(out_pdf, bbox_inches='tight')
 plt.close(fig)
 print(f'Saved → {out_fig}')
+print(f'Saved → {out_pdf}')

@@ -135,22 +135,25 @@ torchrun --standalone --nproc-per-node=8 get_hess_llama.py \
 #### Sketch B (recommended — H_I + H_O, single pass)
 
 Produces both Kronecker factors in one backward pass.
-Add `--cross` to also collect all pairwise cross-block terms.
+Add `--cross` to also collect cross-block terms. By default this keeps the
+original all-pairs behavior; use `--cross_filter` to limit which pairs are
+computed.
 
 ```bash
 # Single GPU, 7B model, all layers, with cross terms
 torchrun --standalone --nproc-per-node=1 get_hess_llama.py \
-    --save_path ./hess_als3_after \
-    --orig_model meta-llama/Llama-2-7b-hf \
+    --save_path ./hess \
+    --orig_model meta-llama/Llama-3.2-1B-Instruct \
     --batch_size 16 \
     --start_layer 0 \
-    --end_layer 2 \
     --hessian_sketch B \
     --power_iters 1 \
     --ctx_size 2048 \
     --n_seqs 2048 \
     --cross \
-    --local_als_iters 3 \
+    --cross_filter block_adjacent \
+    --cross_block_window 1 \
+    --local_als_iters 0 \
     --cpu_offload
 ```
 
@@ -197,9 +200,18 @@ torchrun --standalone --nproc-per-node=8 get_hess_llama.py \
 | `--hessian_sketch` | B | `A` (power iter) or `B` (single pass) |
 | `--power_iters` | 1 | Backward passes; Sketch A needs ≥ 2 |
 | `--cross` | off | Collect pairwise cross-block terms |
+| `--cross_filter` | none | Cross-pair filter: `none`, `linear_adjacent`, or `block_adjacent` |
+| `--cross_block_window` | 1 | Transformer block distance allowed when `--cross_filter block_adjacent` |
 | `--local_als_iters` | 3 | ALS steps for cross-dim pairs (0 = disabled) |
 | `--cpu_offload` | off | Keep Hessian accumulators on CPU RAM |
 | `--fp64_accum` | off | Accumulate in FP64 (slight quality improvement) |
+
+`--cross_filter none` computes every cross-Hessian pair and preserves the
+original collection behavior. `linear_adjacent` keeps only adjacent global
+linear-module indices (`gidx`). `block_adjacent` uses Transformer block indices
+instead and keeps pairs with `abs(block_i - block_j) <= --cross_block_window`,
+so the default window of 1 includes pairs within the same block and pairs across
+neighboring blocks.
 
 **Cross-term ALS note:** when two layers have different output dimensions
 (e.g. attention projections with m=4096 vs MLP up/gate with m=11008),
@@ -250,8 +262,7 @@ a three-panel heatmap.
 
 ```bash
 python visualize_cross_coupling.py \
-    --save_path ./hess_als3_after \
-    --layers 0,1,2 \
+    --save_path ./hess \
     --names q,k,v,o,up,gate,down
 ```
 

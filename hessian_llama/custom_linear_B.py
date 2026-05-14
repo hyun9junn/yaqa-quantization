@@ -28,9 +28,24 @@ def flat_to_sym(V, N):
     A[idxs[1, :], idxs[0, :]] = V
     return A
 
-_LBUF = {}        # key: layer_idx -> (L, layer_name)
+_LBUF = {}        # key: layer_idx -> (L, layer_name, block_idx)
 _BATCH_ID  = [0]  # increments each backward pass
 _PAIRS_DONE = set()  # (i, j) pairs computed in current batch, i < j
+
+
+def should_compute_cross_pair(filter_mode,
+                              block_window,
+                              layer_idx,
+                              other_idx,
+                              block_idx,
+                              other_block_idx):
+    if filter_mode == 'none':
+        return True
+    if filter_mode == 'linear_adjacent':
+        return abs(layer_idx - other_idx) <= 1
+    if filter_mode == 'block_adjacent':
+        return abs(block_idx - other_block_idx) <= block_window
+    raise ValueError(f'Unknown cross_filter: {filter_mode}')
 
 
 class LinearNoBias(torch.autograd.Function):
@@ -58,7 +73,10 @@ class LinearNoBias(torch.autograd.Function):
             op_dtype = ctx.parent_class.op_dtype
             bs = input.shape[0]
             layer_idx = ctx.parent_class.layer_idx
+            block_idx = ctx.parent_class.block_idx
             layer_name = ctx.parent_class.layer_name
+            cross_filter = ctx.parent_class.cross_filter
+            cross_block_window = ctx.parent_class.cross_block_window
 
             with torch.amp.autocast('cuda', enabled=False):
                 if it == 0:
@@ -99,14 +117,6 @@ class LinearNoBias(torch.autograd.Function):
                             out_hess.to(
                                 ctx.parent_class.hout.device).to(op_dtype))
                         ctx.parent_class.ct += bs
-                        if div:
-                            ctx.parent_class.hin.div_(ctx.parent_class.ct)
-                            ctx.parent_class.hout.div_(ctx.parent_class.ct)
-                            for t in ctx.parent_class.cross_hin.values():
-                                t.div_(ctx.parent_class.ct)
-                            for t in ctx.parent_class.cross_hout.values():
-                                t.div_(ctx.parent_class.ct)
-                            ctx.parent_class.ct = 0
 
                     del in_hess, out_hess
                     torch.cuda.empty_cache()
@@ -120,7 +130,9 @@ class LinearNoBias(torch.autograd.Function):
                             _LBUF.clear()
                             _PAIRS_DONE.clear()
 
-                        _LBUF[layer_idx] = (l_grad.detach().cpu(), ctx.parent_class.layer_name)
+                        _LBUF[layer_idx] = (l_grad.detach().cpu(),
+                                            ctx.parent_class.layer_name,
+                                            block_idx)
 
                         # Compute cross with every other layer currently in the buffer.
                         # Use _PAIRS_DONE to ensure each pair is computed exactly once.
@@ -137,7 +149,15 @@ class LinearNoBias(torch.autograd.Function):
                             if pair_key in _PAIRS_DONE:
                                 continue
 
-                            Li, Li_name = _LBUF[other_idx]
+                            Li, Li_name, other_block_idx = _LBUF[other_idx]
+                            if not should_compute_cross_pair(
+                                    cross_filter,
+                                    cross_block_window,
+                                    layer_idx,
+                                    other_idx,
+                                    block_idx,
+                                    other_block_idx):
+                                continue
 
                             Li = Li.to(Lj.device, non_blocking=True).to(Lj.dtype)
 
@@ -164,7 +184,9 @@ class LinearNoBias(torch.autograd.Function):
                                 # Normalise L matrices to unit Frobenius norm before ALS.
                                 # Without this, ||Li||·||Lj|| ~ 10^9 causes the alternating
                                 # updates to explode in O(||Li||^2·||Lj||^2) steps.
-                                # We restore the initial-estimate scale after convergence.
+                                # H_I and H_O also stay normalised inside ALS because their
+                                # scale is non-identifiable: c*H_I and H_O/c represent the
+                                # same Kronecker product.
                                 Li_scale = Li.float().norm().clamp(min=1e-30)
                                 Lj_scale = Lj.float().norm().clamp(min=1e-30)
                                 Li_f = Li.float() / Li_scale
@@ -172,20 +194,18 @@ class LinearNoBias(torch.autograd.Function):
                                 H_I = H_I / H_I.norm().clamp(min=1e-30)
                                 H_O = H_O / H_O.norm().clamp(min=1e-30)
                                 for _ in range(n_als):
-                                    norm_O = H_O.norm()
-                                    if norm_O > 1e-30:
-                                        H_I = Li_f.T @ H_O @ Lj_f / (norm_O ** 2)
-                                    norm_I = H_I.norm()
-                                    if norm_I > 1e-30:
-                                        H_O = Li_f @ H_I @ Lj_f.T / (norm_I ** 2)
-                                # Full-gradient scale: ALS gives direction; recompute magnitude
-                                # using ALL rows/cols of L (no truncation bias).
-                                # Geometric-mean dim normalisation reduces to /m when m_i == m_j,
-                                # consistent with the equal-dim convention.
+                                    H_I_next = Li_f.T @ H_O @ Lj_f
+                                    H_I = H_I_next / H_I_next.norm().clamp(min=1e-30)
+                                    H_O_next = Li_f @ H_I @ Lj_f.T
+                                    H_O = H_O_next / H_O_next.norm().clamp(min=1e-30)
+
+                                # ALS gives directions. Restore a KFAC-compatible scale using
+                                # all rows/cols and geometric-mean dimensions; this reduces to
+                                # /m and /n when the two layers have matching dimensions.
                                 H_I_dir = H_I / H_I.norm().clamp(min=1e-30)
                                 H_O_dir = H_O / H_O.norm().clamp(min=1e-30)
-                                scale_I = (Li_f.T @ H_O_dir @ Lj_f).norm()  # n_i × n_j, all m rows
-                                scale_O = (Li_f @ H_I_dir @ Lj_f.T).norm()  # m_i × m_j, all n cols
+                                scale_I = (Li_f.T @ H_O_dir @ Lj_f).norm()
+                                scale_O = (Li_f @ H_I_dir @ Lj_f.T).norm()
                                 m_eff = (m_i * m_j) ** 0.5
                                 n_eff = (n_i * n_j) ** 0.5
                                 cross_in_hess  = (H_I_dir * (scale_I * Li_scale * Lj_scale / m_eff)).to(op_dtype)
@@ -237,12 +257,23 @@ class CustomLinear(nn.Linear):
                  collect_hess=True,
                  use_fp64=False,
                  *args,
+                 block_idx=None,
+                 cross_filter='none',
+                 cross_block_window=1,
                  **kwargs):
         super().__init__(*args, **kwargs)
 
+        if cross_filter not in ('none', 'linear_adjacent', 'block_adjacent'):
+            raise ValueError(f'Unknown cross_filter: {cross_filter}')
+        if cross_block_window < 0:
+            raise ValueError('cross_block_window must be non-negative')
+
         self.fname = load_fname
         self.layer_idx = layer_idx
+        self.block_idx = layer_idx if block_idx is None else block_idx
         self.layer_name = layer_name
+        self.cross_filter = cross_filter
+        self.cross_block_window = cross_block_window
         self.collect_hess = collect_hess
         self.op_dtype = torch.float32 if not use_fp64 else torch.float64
         if collect_hess and local_rank == buffer_dev:

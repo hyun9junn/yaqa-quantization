@@ -56,8 +56,18 @@ parser.add_argument('--orig_model', type=str)
 parser.add_argument('--cpu_offload', action='store_true')
 parser.add_argument('--fp64_accum', action='store_true')
 parser.add_argument('--cross', action='store_true', default=False)
+parser.add_argument('--cross_filter',
+                    choices=['none', 'linear_adjacent', 'block_adjacent'],
+                    default='none',
+                    help='Filter cross-Hessian pairs before computing them.')
+parser.add_argument('--cross_block_window',
+                    default=1,
+                    type=int,
+                    help='Maximum Transformer block distance for --cross_filter block_adjacent.')
 parser.add_argument('--local_als_iters', default=3, type=int)
 args = parser.parse_args()
+if args.cross_block_window < 0:
+    raise ValueError('--cross_block_window must be non-negative')
 
 
 def setup(rank, world_size):
@@ -113,6 +123,9 @@ with torch.autograd.set_grad_enabled(False):
                                     args.fp64_accum,
                                     l.self_attn.q_proj.in_features,
                                     l.self_attn.q_proj.out_features,
+                                    block_idx=i,
+                                    cross_filter=args.cross_filter,
+                                    cross_block_window=args.cross_block_window,
                                     dtype=l.self_attn.q_proj.weight.dtype)
         new_q.weight = l.self_attn.q_proj.weight
         del l.self_attn.q_proj
@@ -129,6 +142,9 @@ with torch.autograd.set_grad_enabled(False):
                                     args.fp64_accum,
                                     l.self_attn.k_proj.in_features,
                                     l.self_attn.k_proj.out_features,
+                                    block_idx=i,
+                                    cross_filter=args.cross_filter,
+                                    cross_block_window=args.cross_block_window,
                                     dtype=l.self_attn.k_proj.weight.dtype)
         new_k.weight = l.self_attn.k_proj.weight
         del l.self_attn.k_proj
@@ -145,6 +161,9 @@ with torch.autograd.set_grad_enabled(False):
                                     args.fp64_accum,
                                     l.self_attn.v_proj.in_features,
                                     l.self_attn.v_proj.out_features,
+                                    block_idx=i,
+                                    cross_filter=args.cross_filter,
+                                    cross_block_window=args.cross_block_window,
                                     dtype=l.self_attn.v_proj.weight.dtype)
         new_v.weight = l.self_attn.v_proj.weight
         del l.self_attn.v_proj
@@ -161,6 +180,9 @@ with torch.autograd.set_grad_enabled(False):
                                     args.fp64_accum,
                                     l.self_attn.o_proj.in_features,
                                     l.self_attn.o_proj.out_features,
+                                    block_idx=i,
+                                    cross_filter=args.cross_filter,
+                                    cross_block_window=args.cross_block_window,
                                     dtype=l.self_attn.o_proj.weight.dtype)
         new_o.weight = l.self_attn.o_proj.weight
         del l.self_attn.o_proj
@@ -177,6 +199,9 @@ with torch.autograd.set_grad_enabled(False):
                                      args.fp64_accum,
                                      l.mlp.up_proj.in_features,
                                      l.mlp.up_proj.out_features,
+                                     block_idx=i,
+                                     cross_filter=args.cross_filter,
+                                     cross_block_window=args.cross_block_window,
                                      dtype=l.mlp.up_proj.weight.dtype)
         new_up.weight = l.mlp.up_proj.weight
         del l.mlp.up_proj
@@ -193,6 +218,9 @@ with torch.autograd.set_grad_enabled(False):
                                        args.fp64_accum,
                                        l.mlp.gate_proj.in_features,
                                        l.mlp.gate_proj.out_features,
+                                       block_idx=i,
+                                       cross_filter=args.cross_filter,
+                                       cross_block_window=args.cross_block_window,
                                        dtype=l.mlp.gate_proj.weight.dtype)
         new_gate.weight = l.mlp.gate_proj.weight
         del l.mlp.gate_proj
@@ -209,6 +237,9 @@ with torch.autograd.set_grad_enabled(False):
                                        args.fp64_accum,
                                        l.mlp.down_proj.in_features,
                                        l.mlp.down_proj.out_features,
+                                       block_idx=i,
+                                       cross_filter=args.cross_filter,
+                                       cross_block_window=args.cross_block_window,
                                        dtype=l.mlp.down_proj.weight.dtype)
         new_down.weight = l.mlp.down_proj.weight
         del l.mlp.down_proj

@@ -162,6 +162,9 @@ class CustomLinear(nn.Linear):
                  collect_hess=True,
                  use_fp64=False,
                  *args,
+                 block_idx=None,
+                 cross_filter='none',
+                 cross_block_window=1,
                  **kwargs):
         super().__init__(*args, **kwargs)
 
