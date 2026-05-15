@@ -8,7 +8,19 @@ For more details, see the paper.
 
 ## Installation
 
-Requires Python ≥ 3.12, a CUDA 12.6 compatible driver, and `nvcc` on `PATH`.
+Requires Python ≥ 3.12, an NVIDIA driver new enough for the CUDA build you
+install, and `nvcc` on `PATH`.
+
+For Blackwell GPUs such as B200, use a CUDA 12.8+ stack. CUDA 12.6 can install
+and run on older GPUs, but it is not the right target for B200 because Blackwell
+native code generation starts with CUDA 12.8. The recommended path on new
+machines is a CUDA 13.x driver/toolkit with PyTorch `cu130`; CUDA Toolkit 12.8
+with PyTorch `cu128` is also acceptable if you need to stay on CUDA 12.
+
+If `nvidia-smi` reports a driver like `580.95.05` and `CUDA Version: 13.1`, use
+the `cu130` PyTorch wheel below. The `13.1` value is the driver's maximum CUDA
+runtime capability; it is compatible with PyTorch's CUDA 13.0 wheels. `nvcc
+--version` should report CUDA 12.8 or newer before building the local kernel.
 
 ### 1 — Create the venv
 
@@ -32,9 +44,12 @@ replaces PyPI entirely and those packages are not on the PyTorch wheel index.
 # Step A: build tools from PyPI
 uv pip install setuptools packaging wheel
 
-# Step B: torch from the CUDA 12.6 index
+# Step B: torch from the CUDA 13.0 index for Blackwell/B200
 # Use --reinstall if a wrong-CUDA torch is already present
-uv pip install "torch>=2.7.0" --index-url https://download.pytorch.org/whl/cu126
+uv pip install "torch>=2.11.0" --index-url https://download.pytorch.org/whl/cu130
+
+# Alternative for CUDA 12.8 systems:
+# uv pip install "torch>=2.7.0,<2.12" --index-url https://download.pytorch.org/whl/cu128
 ```
 
 ### 3 — Install all remaining dependencies
@@ -44,13 +59,24 @@ CUDA_HOME=/usr/local/cuda uv sync --no-build-isolation
 ```
 
 `uv sync` reads `uv.lock` for a fully reproducible install and pulls PyTorch wheels
-from the CUDA 12.6 index automatically via `[tool.uv.sources]`.
+from the configured CUDA index automatically via `[tool.uv.sources]`.
+
+If your lockfile still points at `cu126`, regenerate it after changing the CUDA
+index:
+
+```bash
+uv lock --upgrade-package torch --upgrade-package triton
+```
 
 ### 4 — Build the local CUDA kernel
 
 ```bash
 uv pip install -e ./qtip-kernels --no-build-isolation
 ```
+
+The extension build now sets `TORCH_CUDA_ARCH_LIST` automatically. With
+CUDA 12.8+ it includes `10.0+PTX` for B200; with older toolkits it omits
+Blackwell because those `nvcc` versions cannot compile `sm_100`.
 
 ### 5 — Log in to Hugging Face
 

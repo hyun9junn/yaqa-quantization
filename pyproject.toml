@@ -12,7 +12,7 @@ description = "Yet Another Quantization Algorithm — Hessian collection and LLM
 requires-python = ">=3.12"
 dependencies = [
     # Core ML
-    "torch>=2.7.0",
+    "torch>=2.11.0",
     "transformers>=4.51.0,<5.0",
     "accelerate>=1.6.0",
     "peft>=0.15.1",
@@ -48,37 +48,21 @@ dependencies = [
 #
 #   uv venv --python 3.12 && source .venv/bin/activate
 #   uv pip install setuptools packaging wheel
-#   uv pip install "torch>=2.7.0" --index-url https://download.pytorch.org/whl/cu126
+#   uv pip install "torch>=2.11.0" --index-url https://download.pytorch.org/whl/cu130
 #   CUDA_HOME=/usr/local/cuda uv sync --no-build-isolation
 #   uv pip install -e ./qtip-kernels --no-build-isolation
 #
 # no-build-isolation lets fast-hadamard-transform see the torch already in .venv.
 no-build-isolation-package = ["fast-hadamard-transform"]
 
-# Packages that must come from the PyTorch CUDA wheel index
-override-dependencies = [
-    "nvidia-cublas-cu12>=12.6",
-    "nvidia-cuda-cupti-cu12>=12.6",
-    "nvidia-cuda-nvrtc-cu12>=12.6",
-    "nvidia-cuda-runtime-cu12>=12.6",
-    "nvidia-cudnn-cu12>=9.5",
-    "nvidia-cufft-cu12>=11.3",
-    "nvidia-curand-cu12>=10.3",
-    "nvidia-cusolver-cu12>=11.7",
-    "nvidia-cusparse-cu12>=12.5",
-    "nvidia-nccl-cu12>=2.26",
-    "nvidia-nvjitlink-cu12>=12.6",
-    "nvidia-nvtx-cu12>=12.6",
-]
-
 [tool.uv.sources]
 fast-hadamard-transform = { git = "https://github.com/Dao-AILab/fast-hadamard-transform.git", tag = "v1.0.4.post1" }
-torch = { index = "pytorch-cu126" }
-torchvision = { index = "pytorch-cu126" }
-torchaudio = { index = "pytorch-cu126" }
-triton = { index = "pytorch-cu126" }
+torch = { index = "pytorch-cu130" }
+torchvision = { index = "pytorch-cu130" }
+torchaudio = { index = "pytorch-cu130" }
+triton = { index = "pytorch-cu130" }
 
 [[tool.uv.index]]
-name = "pytorch-cu126"
-url = "https://download.pytorch.org/whl/cu126"
+name = "pytorch-cu130"
+url = "https://download.pytorch.org/whl/cu130"
 explicit = true
