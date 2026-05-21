@@ -38,11 +38,20 @@ def should_compute_cross_pair(filter_mode,
                               layer_idx,
                               other_idx,
                               block_idx,
-                              other_block_idx):
+                              other_block_idx,
+                              extra_pairs=None):
+    # Explicit extra pairs always included regardless of filter
+    if extra_pairs:
+        pair_key = (min(layer_idx, other_idx), max(layer_idx, other_idx))
+        if pair_key in extra_pairs:
+            return True
     if filter_mode == 'none':
         return True
     if filter_mode == 'linear_adjacent':
         return abs(layer_idx - other_idx) <= 1
+    if filter_mode == 'gidx_band':
+        # block_window is reused as gidx band width
+        return abs(layer_idx - other_idx) <= block_window
     if filter_mode == 'block_adjacent':
         return abs(block_idx - other_block_idx) <= block_window
     raise ValueError(f'Unknown cross_filter: {filter_mode}')
@@ -156,7 +165,8 @@ class LinearNoBias(torch.autograd.Function):
                                     layer_idx,
                                     other_idx,
                                     block_idx,
-                                    other_block_idx):
+                                    other_block_idx,
+                                    extra_pairs=ctx.parent_class.extra_pairs):
                                 continue
 
                             Li = Li.to(Lj.device, non_blocking=True).to(Lj.dtype)
@@ -260,10 +270,11 @@ class CustomLinear(nn.Linear):
                  block_idx=None,
                  cross_filter='none',
                  cross_block_window=1,
+                 extra_pairs=frozenset(),
                  **kwargs):
         super().__init__(*args, **kwargs)
 
-        if cross_filter not in ('none', 'linear_adjacent', 'block_adjacent'):
+        if cross_filter not in ('none', 'linear_adjacent', 'gidx_band', 'block_adjacent'):
             raise ValueError(f'Unknown cross_filter: {cross_filter}')
         if cross_block_window < 0:
             raise ValueError('cross_block_window must be non-negative')
@@ -274,6 +285,7 @@ class CustomLinear(nn.Linear):
         self.layer_name = layer_name
         self.cross_filter = cross_filter
         self.cross_block_window = cross_block_window
+        self.extra_pairs = frozenset(extra_pairs)
         self.collect_hess = collect_hess
         self.op_dtype = torch.float32 if not use_fp64 else torch.float64
         if collect_hess and local_rank == buffer_dev:

@@ -142,7 +142,7 @@ computed.
 ```bash
 # Single GPU, 7B model, all layers, with cross terms
 torchrun --standalone --nproc-per-node=1 get_hess_llama.py \
-    --save_path ./hess \
+    --save_path ./hess_3_more \
     --orig_model meta-llama/Llama-3.2-1B-Instruct \
     --batch_size 16 \
     --start_layer 0 \
@@ -153,7 +153,7 @@ torchrun --standalone --nproc-per-node=1 get_hess_llama.py \
     --cross \
     --cross_filter block_adjacent \
     --cross_block_window 1 \
-    --local_als_iters 0 \
+    --local_als_iters 3 \
     --cpu_offload
 ```
 

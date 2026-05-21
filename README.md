@@ -92,9 +92,197 @@ huggingface-cli login
 ## How to use this codebase
 
 This codebase is based off of the [QTIP](https://github.com/Cornell-RelaxML/qtip) codebase, with modifications made to support YAQA's quantization algorithm.
-To collect Hessians, see the `README` in `hessian_llama/`.
-To quantize models, follow the instructions in the [QTIP codebase](https://github.com/Cornell-RelaxML/qtip).
 Prequantized models and Sketch-B Hessians (see paper) can be found [here](https://huggingface.co/collections/relaxml/yaqa-6837d4c8896eb9ceb7cb899e).
+
+---
+
+## Cross-block Hessian quantization
+
+This section covers the two-step pipeline for **sparse parent-set LDLQ** quantization:
+collect cross-block Hessians with `get_hess_llama.py`, then quantize with
+`quantize_cross_hess_llama.py`.
+
+### Background — weight labels and gidx
+
+Each linear weight is identified by a **label** `{block}_{name}` and a global index **gidx**
+assigned in forward order:
+
+| position in block | name   | gidx offset |
+|:-----------------:|--------|:-----------:|
+| 0                 | `q`    | +0          |
+| 1                 | `k`    | +1          |
+| 2                 | `v`    | +2          |
+| 3                 | `o`    | +3          |
+| 4                 | `up`   | +4          |
+| 5                 | `gate` | +5          |
+| 6                 | `down` | +6          |
+
+So transformer block 0 has gidx 0–6, block 1 has 7–13, and so on.
+
+### Step 1 — Collect cross-block Hessians
+
+Run `hessian_llama/get_hess_llama.py` with `torchrun`.
+Pass `--cross` to enable cross-Hessian collection and use `--parent_band` / `--parent_extra_pairs`
+to control **which pairs are collected**.
+
+```bash
+cd hessian_llama
+
+# ── basic: collect diagonal Hessians only (no cross terms) ───────────────────
+torchrun --nproc_per_node=8 get_hess_llama.py \
+    --orig_model  meta-llama/Llama-3.2-1B-Instruct \
+    --save_path   /path/to/hessians \
+    --n_seqs      65536 \
+    --ctx_size    2048 \
+    --batch_size  2 \
+    --hessian_sketch B
+
+# ── band-1: collect cross-Hessians for immediately adjacent weight pairs ─────
+# (default; captures q↔k, k↔v, ..., gate↔down, down↔next-block-q)
+torchrun --nproc_per_node=8 get_hess_llama.py \
+    --orig_model  meta-llama/Llama-3.2-1B-Instruct \
+    --save_path   /path/to/hessians \
+    --n_seqs      65536 \
+    --batch_size  2 \
+    --hessian_sketch B \
+    --cross \
+    --parent_band 1
+
+# ── band-2: widen the band to capture two-hop neighbours ─────────────────────
+torchrun --nproc_per_node=8 get_hess_llama.py \
+    --orig_model  meta-llama/Llama-3.2-1B-Instruct \
+    --save_path   /path/to/hessians \
+    --n_seqs      65536 \
+    --batch_size  2 \
+    --hessian_sketch B \
+    --cross \
+    --parent_band 2
+
+# ── block-adjacent: collect all pairs across adjacent transformer blocks ──────
+# window=1 → all 7×7=49 weight pairs per block boundary (old default behaviour)
+torchrun --nproc_per_node=1 get_hess_llama.py \
+    --orig_model  meta-llama/Llama-3.2-1B-Instruct \
+    --save_path   ./block_hess \
+    --end_layer 4 \
+    --n_seqs      1024 \
+    --batch_size  4 \
+    --hessian_sketch B \
+    --cross \
+    --parent_block_window 2
+
+# ── band-1 + explicit extra pairs ────────────────────────────────────────────
+# Adds q↔v and gate↔down within every block on top of the band.
+# Use '*' as a block-index wildcard — expands across all layers automatically.
+torchrun --nproc_per_node=8 get_hess_llama.py \
+    --orig_model  meta-llama/Llama-3.2-1B-Instruct \
+    --save_path   /path/to/hessians \
+    --n_seqs      65536 \
+    --batch_size  2 \
+    --hessian_sketch B \
+    --cross \
+    --parent_band 1 \
+    --parent_extra_pairs "*_q,*_v;*_gate,*_down"
+```
+
+**Key arguments**
+
+| argument | default | description |
+|---|---|---|
+| `--cross` | off | enable cross-Hessian collection |
+| `--parent_band W` | `1` | collect pairs with `\|gidx_i − gidx_j\| ≤ W` (gidx distance) |
+| `--parent_block_window W` | off | collect pairs with `\|block_i − block_j\| ≤ W` (transformer block distance); overrides `--parent_band` when set |
+| `--parent_extra_pairs STR` | `""` | always collect these named pairs on top of the band (see format above) |
+| `--local_als_iters N` | `3` | ALS iterations for unequal-dimension pair approximation |
+| `--start_layer` / `--end_layer` | `0` / `∞` | collect Hessians only for these transformer blocks |
+| `--cpu_offload` | off | offload Hessian accumulators to CPU (saves GPU memory) |
+
+Saved files follow the naming convention:
+- `{label}_hin.pt` / `{label}_hout.pt` — diagonal (input/output) Hessian sketches
+- `{label}_cross{partner_gidx}_hin.pt` / `…_hout.pt` — cross-block Kronecker factors
+
+### Step 2 — Quantize with sparse parent-set LDLQ
+
+Run `quantize_llama/quantize_cross_hess_llama.py` to quantize the model using the
+collected Hessians. The **parent set P(k)** for each weight k determines which
+previously-quantized weights contribute a cross-block correction:
+
+```
+W_eff[k] = W[k] + Σ_{j ∈ P(k)}  B_{k,j} · ΔW_j · A_{k,j}ᵀ
+```
+
+```bash
+cd quantize_llama
+
+# ── band-1 only (current YAQA default) ───────────────────────────────────────
+python quantize_cross_hess_llama.py \
+    --base_model meta-llama/Llama-3.2-1B-Instruct \
+    --hess_path  /path/to/hessians \
+    --save_path  /path/to/quantized \
+    --codebook   E8P12 \
+    --parent_band 1
+
+# ── band-1 + top-3 strong pairs (by cross-Hessian magnitude) ─────────────────
+# Scans up to 50 gidx steps back and picks the 3 strongest additional parents.
+python quantize_cross_hess_llama.py \
+    --base_model meta-llama/Llama-3.2-1B-Instruct \
+    --hess_path  /path/to/hessians \
+    --save_path  /path/to/quantized \
+    --codebook   E8P12 \
+    --parent_band 1 \
+    --parent_topR 3 \
+    --parent_lookback 50
+
+# ── band-1 + threshold on strength ───────────────────────────────────────────
+python quantize_cross_hess_llama.py \
+    --base_model meta-llama/Llama-3.2-1B-Instruct \
+    --hess_path  /path/to/hessians \
+    --save_path  /path/to/quantized \
+    --codebook   E8P12 \
+    --parent_band 1 \
+    --parent_threshold 0.05
+
+# ── explicit parent sets ──────────────────────────────────────────────────────
+# Use '*' as a block-index wildcard — expands across all layers automatically.
+# "*_v:*_q" means: for every block i, v[i] gets cross-correction from q[i].
+python quantize_cross_hess_llama.py \
+    --base_model meta-llama/Llama-3.2-1B-Instruct \
+    --hess_path  /path/to/hessians \
+    --save_path  /path/to/quantized \
+    --codebook   E8P12 \
+    --parent_band 1 \
+    --parent_explicit "*_v:*_q"
+
+# ── ablation: disable all cross corrections ───────────────────────────────────
+python quantize_cross_hess_llama.py \
+    --base_model meta-llama/Llama-3.2-1B-Instruct \
+    --hess_path  /workspace/yaqa-quantization/hessian_llama/no_cross \
+    --save_path  ./no_cross \
+    --codebook   E8P12 \
+    --no_cross
+```
+
+**Parent set arguments**
+
+| argument | default | description |
+|---|---|---|
+| `--parent_band W` | `1` | include all j with `gidx_k − gidx_j ≤ W` in P(k) |
+| `--parent_topR R` | `0` | add top-R strongest parents beyond the band (0 = off) |
+| `--parent_threshold τ` | `0.0` | add parents with `‖H_I‖·‖H_O‖ > τ` (0 = off) |
+| `--parent_lookback M` | `50` | max gidx distance to search for topR / threshold |
+| `--parent_explicit STR` | `""` | explicit per-weight parent sets (see format above) |
+| `--no_cross` | off | disable all cross corrections (ablation) |
+
+**Other key arguments**
+
+| argument | default | description |
+|---|---|---|
+| `--codebook` | required | codebook name, e.g. `E8P12` |
+| `--L` / `--K` / `--V` | 16/2/2 | trellis parameters |
+| `--td_x` / `--td_y` | 16/16 | tile dimensions |
+| `--sigma_reg` | `1e-2` | Hessian diagonal regularisation |
+| `--scale_override` | `1.0` | weight scale multiplier |
+| `--skip_list` | `""` | comma-separated labels to skip, e.g. `0_q,1_k` |
+| `--device` | `cuda:0` | device to quantize on |
 
 ## Other
 

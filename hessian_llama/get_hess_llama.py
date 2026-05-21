@@ -56,18 +56,74 @@ parser.add_argument('--orig_model', type=str)
 parser.add_argument('--cpu_offload', action='store_true')
 parser.add_argument('--fp64_accum', action='store_true')
 parser.add_argument('--cross', action='store_true', default=False)
-parser.add_argument('--cross_filter',
-                    choices=['none', 'linear_adjacent', 'block_adjacent'],
-                    default='none',
-                    help='Filter cross-Hessian pairs before computing them.')
-parser.add_argument('--cross_block_window',
+parser.add_argument('--parent_band',
                     default=1,
                     type=int,
-                    help='Maximum Transformer block distance for --cross_filter block_adjacent.')
+                    help='Collect cross-Hessians for all weight pairs within this gidx distance. '
+                         'Ignored when --parent_block_window is set.')
+parser.add_argument('--parent_block_window',
+                    default=-1,
+                    type=int,
+                    help='Alternative to --parent_band: collect cross-Hessians for all weight '
+                         'pairs whose transformer block indices differ by at most this value. '
+                         'Window=1 collects all pairs across adjacent blocks (7×7=49 pairs per '
+                         'boundary). Set to -1 (default) to use --parent_band instead.')
+parser.add_argument('--parent_extra_pairs',
+                    default='',
+                    type=str,
+                    help='Always collect these additional cross-Hessian pairs regardless of band. '
+                         'Format: "labelA,labelB;..." where labels are block_name (e.g. "0_q"). '
+                         'Use "*" as a block-index wildcard to expand across all layers: '
+                         '"*_q,*_v" collects q↔v for every block. '
+                         'Names: q, k, v, o, up, gate, down.')
 parser.add_argument('--local_als_iters', default=3, type=int)
 args = parser.parse_args()
-if args.cross_block_window < 0:
-    raise ValueError('--cross_block_window must be non-negative')
+if args.parent_band < 0:
+    raise ValueError('--parent_band must be non-negative')
+if args.parent_block_window == 0:
+    raise ValueError('--parent_block_window must be >= 1 (or -1 to disable)')
+
+
+LAYER_ORDER = ['q', 'k', 'v', 'o', 'up', 'gate', 'down']
+
+
+def label_to_gidx(label: str) -> int:
+    """Convert weight label like '3_gate' to global weight index."""
+    block_str, *name_parts = label.split('_')
+    name = '_'.join(name_parts)
+    return int(block_str) * len(LAYER_ORDER) + LAYER_ORDER.index(name)
+
+
+def parse_extra_pairs(extra_pairs_str: str, num_layers: int) -> frozenset:
+    """Parse pair spec into frozenset of (min_gidx, max_gidx).
+
+    Use '*' as a wildcard for the block index to expand a pattern across all layers.
+    Examples:
+        "0_q,0_v"          one explicit pair
+        "*_q,*_v"           q↔v for every block  (expands to 0_q,0_v;1_q,1_v;...)
+        "0_q,0_v;*_gate,*_down"  mix of explicit and wildcard
+    """
+    pairs = set()
+    if not extra_pairs_str.strip():
+        return frozenset()
+    for pair in extra_pairs_str.split(';'):
+        pair = pair.strip()
+        if not pair:
+            continue
+        parts = [p.strip() for p in pair.split(',')]
+        if len(parts) != 2:
+            raise ValueError(f'Invalid pair (expected "labelA,labelB"): {pair!r}')
+        l1, l2 = parts
+        if '*' in l1 or '*' in l2:
+            for i in range(num_layers):
+                g1 = label_to_gidx(l1.replace('*', str(i)))
+                g2 = label_to_gidx(l2.replace('*', str(i)))
+                pairs.add((min(g1, g2), max(g1, g2)))
+        else:
+            g1 = label_to_gidx(l1)
+            g2 = label_to_gidx(l2)
+            pairs.add((min(g1, g2), max(g1, g2)))
+    return frozenset(pairs)
 
 
 def setup(rank, world_size):
@@ -92,6 +148,22 @@ if local_rank == 0:
 model = LlamaForCausalLM.from_pretrained(args.orig_model,
                                          torch_dtype='auto',
                                          device_map='cpu')
+
+extra_pairs = parse_extra_pairs(args.parent_extra_pairs, len(model.model.layers))
+if local_rank == 0 and extra_pairs:
+    print(f'Extra cross-Hessian pairs (gidx): {sorted(extra_pairs)}')
+
+# Resolve filter mode: block_adjacent takes priority over gidx_band when set.
+if args.parent_block_window >= 1:
+    _cross_filter = 'block_adjacent'
+    _cross_window = args.parent_block_window
+    if local_rank == 0:
+        print(f'Cross-Hessian filter: block_adjacent (window={_cross_window})')
+else:
+    _cross_filter = 'gidx_band'
+    _cross_window = args.parent_band
+    if local_rank == 0:
+        print(f'Cross-Hessian filter: gidx_band (band={_cross_window})')
 
 if args.hessian_sketch == 'A':
     custom_linear_layer = CLA
@@ -124,8 +196,9 @@ with torch.autograd.set_grad_enabled(False):
                                     l.self_attn.q_proj.in_features,
                                     l.self_attn.q_proj.out_features,
                                     block_idx=i,
-                                    cross_filter=args.cross_filter,
-                                    cross_block_window=args.cross_block_window,
+                                    cross_filter=_cross_filter,
+                                    cross_block_window=_cross_window,
+                                    extra_pairs=extra_pairs,
                                     dtype=l.self_attn.q_proj.weight.dtype)
         new_q.weight = l.self_attn.q_proj.weight
         del l.self_attn.q_proj
@@ -143,8 +216,9 @@ with torch.autograd.set_grad_enabled(False):
                                     l.self_attn.k_proj.in_features,
                                     l.self_attn.k_proj.out_features,
                                     block_idx=i,
-                                    cross_filter=args.cross_filter,
-                                    cross_block_window=args.cross_block_window,
+                                    cross_filter=_cross_filter,
+                                    cross_block_window=_cross_window,
+                                    extra_pairs=extra_pairs,
                                     dtype=l.self_attn.k_proj.weight.dtype)
         new_k.weight = l.self_attn.k_proj.weight
         del l.self_attn.k_proj
@@ -162,8 +236,9 @@ with torch.autograd.set_grad_enabled(False):
                                     l.self_attn.v_proj.in_features,
                                     l.self_attn.v_proj.out_features,
                                     block_idx=i,
-                                    cross_filter=args.cross_filter,
-                                    cross_block_window=args.cross_block_window,
+                                    cross_filter=_cross_filter,
+                                    cross_block_window=_cross_window,
+                                    extra_pairs=extra_pairs,
                                     dtype=l.self_attn.v_proj.weight.dtype)
         new_v.weight = l.self_attn.v_proj.weight
         del l.self_attn.v_proj
@@ -181,8 +256,9 @@ with torch.autograd.set_grad_enabled(False):
                                     l.self_attn.o_proj.in_features,
                                     l.self_attn.o_proj.out_features,
                                     block_idx=i,
-                                    cross_filter=args.cross_filter,
-                                    cross_block_window=args.cross_block_window,
+                                    cross_filter=_cross_filter,
+                                    cross_block_window=_cross_window,
+                                    extra_pairs=extra_pairs,
                                     dtype=l.self_attn.o_proj.weight.dtype)
         new_o.weight = l.self_attn.o_proj.weight
         del l.self_attn.o_proj
@@ -200,8 +276,9 @@ with torch.autograd.set_grad_enabled(False):
                                      l.mlp.up_proj.in_features,
                                      l.mlp.up_proj.out_features,
                                      block_idx=i,
-                                     cross_filter=args.cross_filter,
-                                     cross_block_window=args.cross_block_window,
+                                     cross_filter=_cross_filter,
+                                     cross_block_window=_cross_window,
+                                     extra_pairs=extra_pairs,
                                      dtype=l.mlp.up_proj.weight.dtype)
         new_up.weight = l.mlp.up_proj.weight
         del l.mlp.up_proj
@@ -219,8 +296,9 @@ with torch.autograd.set_grad_enabled(False):
                                        l.mlp.gate_proj.in_features,
                                        l.mlp.gate_proj.out_features,
                                        block_idx=i,
-                                       cross_filter=args.cross_filter,
-                                       cross_block_window=args.cross_block_window,
+                                       cross_filter=_cross_filter,
+                                       cross_block_window=_cross_window,
+                                       extra_pairs=extra_pairs,
                                        dtype=l.mlp.gate_proj.weight.dtype)
         new_gate.weight = l.mlp.gate_proj.weight
         del l.mlp.gate_proj
@@ -238,8 +316,9 @@ with torch.autograd.set_grad_enabled(False):
                                        l.mlp.down_proj.in_features,
                                        l.mlp.down_proj.out_features,
                                        block_idx=i,
-                                       cross_filter=args.cross_filter,
-                                       cross_block_window=args.cross_block_window,
+                                       cross_filter=_cross_filter,
+                                       cross_block_window=_cross_window,
+                                       extra_pairs=extra_pairs,
                                        dtype=l.mlp.down_proj.weight.dtype)
         new_down.weight = l.mlp.down_proj.weight
         del l.mlp.down_proj
