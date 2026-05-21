@@ -17,12 +17,18 @@ Usage:
 """
 
 import argparse
+import json
 import os
+import sys
 
 import glog
 import torch
 from operator import attrgetter
 from transformers import AutoModelForCausalLM
+
+REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if REPO_ROOT not in sys.path:
+    sys.path.insert(0, REPO_ROOT)
 
 from lib import utils
 from lib.algo import ldlq
@@ -83,6 +89,9 @@ parser.add_argument('--parent_explicit',  default='',   type=str,
                          'e.g. "1_q:0_v,0_gate;2_down:1_up". '
                          'Use "*" as a block-index wildcard to expand across all layers: '
                          '"*_v:*_q" means every v gets q of the same block as a parent.')
+parser.add_argument('--parent_map',       default='',   type=str,
+                    help='JSON file produced by hessian_llama/select_cross_hessian_pairs.py. '
+                         'Its parent_map/edges are added to P(k).')
 
 
 # ── parent set helpers ────────────────────────────────────────────────────────
@@ -130,6 +139,64 @@ def _parse_explicit_parent_map(parent_explicit_str: str, gidx_to_label: dict,
     return parent_map
 
 
+def _merge_parent_maps(*maps: dict) -> dict:
+    merged = {}
+    for parent_map in maps:
+        for k, parents in parent_map.items():
+            merged.setdefault(k, set()).update(parents)
+    return {k: sorted(v) for k, v in merged.items()}
+
+
+def _parse_parent_map_file(parent_map_path: str, gidx_to_label: dict) -> dict:
+    if not parent_map_path:
+        return {}
+    label_to_gidx = {v: k for k, v in gidx_to_label.items()}
+    with open(parent_map_path) as f:
+        payload = json.load(f)
+
+    parent_map = {}
+    if 'parent_map' in payload:
+        for child_label, parent_labels in payload['parent_map'].items():
+            if child_label not in label_to_gidx:
+                raise ValueError(f'Unknown child label in --parent_map: {child_label}')
+            child_gidx = label_to_gidx[child_label]
+            for parent_label in parent_labels:
+                if parent_label not in label_to_gidx:
+                    raise ValueError(f'Unknown parent label in --parent_map: {parent_label}')
+                parent_gidx = label_to_gidx[parent_label]
+                if parent_gidx >= child_gidx:
+                    raise ValueError(
+                        f'--parent_map only supports already-quantized parents: '
+                        f'{parent_label} must have gidx < {child_label}')
+                parent_map.setdefault(child_gidx, []).append(parent_gidx)
+    elif 'edges' in payload:
+        for edge in payload['edges']:
+            child_label = edge['child']
+            parent_label = edge['parent']
+            if child_label not in label_to_gidx or parent_label not in label_to_gidx:
+                raise ValueError(f'Unknown edge in --parent_map: {parent_label}->{child_label}')
+            child_gidx = label_to_gidx[child_label]
+            parent_gidx = label_to_gidx[parent_label]
+            if parent_gidx >= child_gidx:
+                raise ValueError(
+                    f'--parent_map only supports already-quantized parents: '
+                    f'{parent_label} must have gidx < {child_label}')
+            parent_map.setdefault(child_gidx, []).append(parent_gidx)
+    else:
+        raise ValueError('--parent_map JSON must contain either "parent_map" or "edges"')
+
+    return {k: sorted(set(v)) for k, v in parent_map.items()}
+
+
+def _max_explicit_parent_distance(explicit_map: dict) -> int:
+    max_dist = 0
+    for k_gidx, parents in explicit_map.items():
+        for j_gidx in parents:
+            if j_gidx < k_gidx:
+                max_dist = max(max_dist, k_gidx - j_gidx)
+    return max_dist
+
+
 def compute_parent_set(k_gidx: int, k_label: str, args, history: dict,
                        gidx_to_label: dict, explicit_map: dict) -> list:
     """Return sorted list of parent gidx values in P(k).
@@ -167,7 +234,7 @@ def compute_parent_set(k_gidx: int, k_label: str, args, history: dict,
         if args.parent_threshold > 0.0:
             parents.update(j for j, s in candidates.items() if s > args.parent_threshold)
 
-    # Explicit parents
+    # Explicit or selected parent-map parents
     for j in explicit_map.get(k_gidx, []):
         if j in history:
             parents.add(j)
@@ -284,6 +351,8 @@ def quantize_transformer_layer(layer, layer_idx, cb, args, device, skip_list,
     effective_lookback = args.parent_band
     if args.parent_topR > 0 or args.parent_threshold > 0.0 or explicit_map:
         effective_lookback = max(effective_lookback, args.parent_lookback)
+    effective_lookback = max(effective_lookback,
+                             _max_explicit_parent_distance(explicit_map))
 
     for name in LAYER_ORDER:
         gidx  = layer_idx * len(LAYER_ORDER) + LAYER_ORDER.index(name)
@@ -422,8 +491,10 @@ def main(args):
         for pos, name in enumerate(LAYER_ORDER)
     }
     explicit_map = _parse_explicit_parent_map(args.parent_explicit, gidx_to_label, num_layers)
+    selected_map = _parse_parent_map_file(args.parent_map, gidx_to_label)
+    explicit_map = _merge_parent_maps(explicit_map, selected_map)
     if explicit_map:
-        glog.info(f'Explicit parent map: { {gidx_to_label[k]: [gidx_to_label[j] for j in vs] for k, vs in explicit_map.items()} }')
+        glog.info(f'Parent map: { {gidx_to_label[k]: [gidx_to_label[j] for j in vs] for k, vs in explicit_map.items()} }')
 
     quip_params = {
         'codebook':         args.codebook,
@@ -442,7 +513,8 @@ def main(args):
 
     glog.info('Model loaded')
     glog.info(f'Parent set: band={args.parent_band}, topR={args.parent_topR}, '
-              f'threshold={args.parent_threshold}, lookback={args.parent_lookback}')
+              f'threshold={args.parent_threshold}, lookback={args.parent_lookback}, '
+              f'parent_map={args.parent_map or "none"}')
 
     history = {}
     for i in range(num_layers):
