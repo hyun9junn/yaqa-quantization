@@ -74,6 +74,17 @@ def compute_cross_correction(delta_W_prev, cross_hin, cross_hout,
     n_prev = Hin_prev_sym.shape[0]
     m_prev = Hout_prev_sym.shape[0]
 
+    if delta_W_prev.shape != (m_prev, n_prev):
+        raise ValueError(
+            f'delta_W_prev shape {tuple(delta_W_prev.shape)} does not match '
+            f'previous Hessian shape {(m_prev, n_prev)}')
+    if cross_hin.shape[1] != n_prev:
+        raise ValueError(
+            f'cross_hin shape {tuple(cross_hin.shape)} must be (n_curr, {n_prev})')
+    if cross_hout.shape[1] != m_prev:
+        raise ValueError(
+            f'cross_hout shape {tuple(cross_hout.shape)} must be (m_curr, {m_prev})')
+
     Hp_in  = Hin_prev_sym.clone().to(device, dtype=torch.float64)
     Hp_out = Hout_prev_sym.clone().to(device, dtype=torch.float64)
     ch_in  = cross_hin.to(device, dtype=torch.float64)
