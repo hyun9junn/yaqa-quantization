@@ -77,6 +77,14 @@ parser.add_argument('--parent_extra_pairs',
                          '"*_q,*_v" collects q↔v for every block. '
                          'Names: q, k, v, o, up, gate, down.')
 parser.add_argument('--local_als_iters', default=3, type=int)
+parser.add_argument('--cross_estimator',
+                    choices=['per_sample', 'batch_aggregate'],
+                    default='per_sample',
+                    help='Estimator used when --cross is enabled. per_sample matches the original YAQA diagonal estimator; batch_aggregate preserves the earlier cross prototype behavior.')
+parser.add_argument('--calib_dataset',
+                    choices=['redpajama', 'c4'],
+                    default='redpajama',
+                    help='Calibration dataset. redpajama matches the original YAQA script; c4 is the maintained fallback used by the cross-Hessian experiments.')
 args = parser.parse_args()
 if args.parent_band < 0:
     raise ValueError('--parent_band must be non-negative')
@@ -150,20 +158,21 @@ model = LlamaForCausalLM.from_pretrained(args.orig_model,
                                          device_map='cpu')
 
 extra_pairs = parse_extra_pairs(args.parent_extra_pairs, len(model.model.layers))
+hessian_estimator = args.cross_estimator if args.cross else 'per_sample'
 if local_rank == 0 and extra_pairs:
     print(f'Extra cross-Hessian pairs (gidx): {sorted(extra_pairs)}')
+if local_rank == 0:
+    print(f'Hessian estimator: {hessian_estimator}')
 
 # Resolve filter mode: block_adjacent takes priority over gidx_band when set.
 if args.parent_block_window >= 1:
     _cross_filter = 'block_adjacent'
     _cross_window = args.parent_block_window
-    if local_rank == 0:
-        print(f'Cross-Hessian filter: block_adjacent (window={_cross_window})')
 else:
     _cross_filter = 'gidx_band'
     _cross_window = args.parent_band
-    if local_rank == 0:
-        print(f'Cross-Hessian filter: gidx_band (band={_cross_window})')
+if local_rank == 0 and args.cross:
+    print(f'Cross-Hessian filter: {_cross_filter} (window={_cross_window})')
 
 if args.hessian_sketch == 'A':
     custom_linear_layer = CLA
@@ -189,7 +198,7 @@ with torch.autograd.set_grad_enabled(False):
         name = f'{i}_q'
         new_q = custom_linear_layer(device_ct % local_world_size,
                                     args.cpu_offload,
-                                    name,
+                                    os.path.join(args.save_path, name),
                                     gidx, 'q',
                                     collect_hess,
                                     args.fp64_accum,
@@ -199,6 +208,7 @@ with torch.autograd.set_grad_enabled(False):
                                     cross_filter=_cross_filter,
                                     cross_block_window=_cross_window,
                                     extra_pairs=extra_pairs,
+                                    hessian_estimator=hessian_estimator,
                                     dtype=l.self_attn.q_proj.weight.dtype)
         new_q.weight = l.self_attn.q_proj.weight
         del l.self_attn.q_proj
@@ -209,7 +219,7 @@ with torch.autograd.set_grad_enabled(False):
         name = f'{i}_k'
         new_k = custom_linear_layer(device_ct % local_world_size,
                                     args.cpu_offload,
-                                    name,
+                                    os.path.join(args.save_path, name),
                                     gidx, 'k',
                                     collect_hess,
                                     args.fp64_accum,
@@ -219,6 +229,7 @@ with torch.autograd.set_grad_enabled(False):
                                     cross_filter=_cross_filter,
                                     cross_block_window=_cross_window,
                                     extra_pairs=extra_pairs,
+                                    hessian_estimator=hessian_estimator,
                                     dtype=l.self_attn.k_proj.weight.dtype)
         new_k.weight = l.self_attn.k_proj.weight
         del l.self_attn.k_proj
@@ -229,7 +240,7 @@ with torch.autograd.set_grad_enabled(False):
         name = f'{i}_v'
         new_v = custom_linear_layer(device_ct % local_world_size,
                                     args.cpu_offload,
-                                    name,
+                                    os.path.join(args.save_path, name),
                                     gidx, 'v',
                                     collect_hess,
                                     args.fp64_accum,
@@ -239,6 +250,7 @@ with torch.autograd.set_grad_enabled(False):
                                     cross_filter=_cross_filter,
                                     cross_block_window=_cross_window,
                                     extra_pairs=extra_pairs,
+                                    hessian_estimator=hessian_estimator,
                                     dtype=l.self_attn.v_proj.weight.dtype)
         new_v.weight = l.self_attn.v_proj.weight
         del l.self_attn.v_proj
@@ -249,7 +261,7 @@ with torch.autograd.set_grad_enabled(False):
         name = f'{i}_o'
         new_o = custom_linear_layer(device_ct % local_world_size,
                                     args.cpu_offload,
-                                    name,
+                                    os.path.join(args.save_path, name),
                                     gidx, 'o',
                                     collect_hess,
                                     args.fp64_accum,
@@ -259,6 +271,7 @@ with torch.autograd.set_grad_enabled(False):
                                     cross_filter=_cross_filter,
                                     cross_block_window=_cross_window,
                                     extra_pairs=extra_pairs,
+                                    hessian_estimator=hessian_estimator,
                                     dtype=l.self_attn.o_proj.weight.dtype)
         new_o.weight = l.self_attn.o_proj.weight
         del l.self_attn.o_proj
@@ -269,7 +282,7 @@ with torch.autograd.set_grad_enabled(False):
         name = f'{i}_up'
         new_up = custom_linear_layer(device_ct % local_world_size,
                                      args.cpu_offload,
-                                     name,
+                                     os.path.join(args.save_path, name),
                                      gidx, 'up',
                                      collect_hess,
                                      args.fp64_accum,
@@ -279,6 +292,7 @@ with torch.autograd.set_grad_enabled(False):
                                      cross_filter=_cross_filter,
                                      cross_block_window=_cross_window,
                                      extra_pairs=extra_pairs,
+                                     hessian_estimator=hessian_estimator,
                                      dtype=l.mlp.up_proj.weight.dtype)
         new_up.weight = l.mlp.up_proj.weight
         del l.mlp.up_proj
@@ -289,7 +303,7 @@ with torch.autograd.set_grad_enabled(False):
         name = f'{i}_gate'
         new_gate = custom_linear_layer(device_ct % local_world_size,
                                        args.cpu_offload,
-                                       name,
+                                       os.path.join(args.save_path, name),
                                        gidx, 'gate',
                                        collect_hess,
                                        args.fp64_accum,
@@ -299,6 +313,7 @@ with torch.autograd.set_grad_enabled(False):
                                        cross_filter=_cross_filter,
                                        cross_block_window=_cross_window,
                                        extra_pairs=extra_pairs,
+                                       hessian_estimator=hessian_estimator,
                                        dtype=l.mlp.gate_proj.weight.dtype)
         new_gate.weight = l.mlp.gate_proj.weight
         del l.mlp.gate_proj
@@ -309,7 +324,7 @@ with torch.autograd.set_grad_enabled(False):
         name = f'{i}_down'
         new_down = custom_linear_layer(device_ct % local_world_size,
                                        args.cpu_offload,
-                                       name,
+                                       os.path.join(args.save_path, name),
                                        gidx, 'down',
                                        collect_hess,
                                        args.fp64_accum,
@@ -319,6 +334,7 @@ with torch.autograd.set_grad_enabled(False):
                                        cross_filter=_cross_filter,
                                        cross_block_window=_cross_window,
                                        extra_pairs=extra_pairs,
+                                       hessian_estimator=hessian_estimator,
                                        dtype=l.mlp.down_proj.weight.dtype)
         new_down.weight = l.mlp.down_proj.weight
         del l.mlp.down_proj
@@ -356,8 +372,12 @@ for pit in range(args.power_iters):
 
     if local_rank == 0:
         print(f'POWER ITERATION {pit}')
-        dataset = load_dataset('allenai/c4', 'en', split='train',
-                               streaming=True).shuffle(seed=args.seed, buffer_size=10000)
+        if args.calib_dataset == 'c4':
+            dataset = load_dataset('allenai/c4', 'en', split='train',
+                                   streaming=True).shuffle(seed=args.seed, buffer_size=10000)
+        else:
+            dataset = load_dataset('togethercomputer/RedPajama-Data-1T-Sample',
+                                   split='train').shuffle(args.seed)
         dl = iter(
             torch.utils.data.DataLoader(
                 FullCtx(iter(dataset), tok, args.ctx_size),
@@ -390,24 +410,16 @@ for pit in range(args.power_iters):
             for l in model.modules():
                 if hasattr(l, 'hin'):
                     ct = max(l.ct, 1)
-                    torch.save(
-                        l.hin / ct,
-                        os.path.join(args.save_path, f'{l.fname}_hin.pt'))
-                    torch.save(
-                        l.hout / ct,
-                        os.path.join(args.save_path, f'{l.fname}_hout.pt'))
+                    torch.save(l.hin / ct, f'{l.fname}_hin.pt')
+                    torch.save(l.hout / ct, f'{l.fname}_hout.pt')
                     
                 if hasattr(l, 'cross_hin'):
                     for other_idx, tensor in l.cross_hin.items():
-                        torch.save(
-                            tensor / ct,
-                            os.path.join(args.save_path,
-                                         f'{l.fname}_cross{other_idx}_hin.pt'))
+                        torch.save(tensor / ct,
+                                   f'{l.fname}_cross{other_idx}_hin.pt')
                 if hasattr(l, 'cross_hout'):
                     for other_idx, tensor in l.cross_hout.items():
-                        torch.save(
-                            tensor / ct,
-                            os.path.join(args.save_path,
-                                         f'{l.fname}_cross{other_idx}_hout.pt'))
+                        torch.save(tensor / ct,
+                                   f'{l.fname}_cross{other_idx}_hout.pt')
 
             print(f'RANK {local_rank} SAVED CURRENT HESSIANS')

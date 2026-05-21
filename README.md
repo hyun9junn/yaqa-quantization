@@ -128,58 +128,73 @@ to control **which pairs are collected**.
 ```bash
 cd hessian_llama
 
-# ── basic: collect diagonal Hessians only (no cross terms) ───────────────────
-torchrun --nproc_per_node=8 get_hess_llama.py \
+# ── basic: collect original-YAQA diagonal Hessians only (no cross terms) ─────
+# Explicitly set ctx_size / n_seqs / batch_size for reproducibility.
+torchrun --standalone --nproc-per-node=8 get_hess_llama.py \
     --orig_model  meta-llama/Llama-3.2-1B-Instruct \
     --save_path   /path/to/hessians \
     --n_seqs      65536 \
     --ctx_size    2048 \
     --batch_size  2 \
-    --hessian_sketch B
+    --hessian_sketch B \
+    --power_iters 1 \
+    --calib_dataset redpajama
 
 # ── band-1: collect cross-Hessians for immediately adjacent weight pairs ─────
 # (default; captures q↔k, k↔v, ..., gate↔down, down↔next-block-q)
-torchrun --nproc_per_node=8 get_hess_llama.py \
+torchrun --standalone --nproc-per-node=8 get_hess_llama.py \
     --orig_model  meta-llama/Llama-3.2-1B-Instruct \
     --save_path   /path/to/hessians \
     --n_seqs      65536 \
+    --ctx_size    2048 \
     --batch_size  2 \
     --hessian_sketch B \
+    --power_iters 1 \
     --cross \
+    --cross_estimator per_sample \
     --parent_band 1
 
 # ── band-2: widen the band to capture two-hop neighbours ─────────────────────
-torchrun --nproc_per_node=8 get_hess_llama.py \
+torchrun --standalone --nproc-per-node=8 get_hess_llama.py \
     --orig_model  meta-llama/Llama-3.2-1B-Instruct \
     --save_path   /path/to/hessians \
     --n_seqs      65536 \
+    --ctx_size    2048 \
     --batch_size  2 \
     --hessian_sketch B \
+    --power_iters 1 \
     --cross \
+    --cross_estimator per_sample \
     --parent_band 2
 
 # ── block-adjacent: collect all pairs across adjacent transformer blocks ──────
 # window=1 → all 7×7=49 weight pairs per block boundary (old default behaviour)
-torchrun --nproc_per_node=1 get_hess_llama.py \
+torchrun --standalone --nproc-per-node=1 get_hess_llama.py \
     --orig_model  meta-llama/Llama-3.2-1B-Instruct \
     --save_path   ./block_hess \
     --end_layer 4 \
     --n_seqs      1024 \
+    --ctx_size    2048 \
     --batch_size  4 \
     --hessian_sketch B \
+    --power_iters 1 \
     --cross \
-    --parent_block_window 2
+    --cross_estimator per_sample \
+    --parent_block_window 1
 
 # ── band-1 + explicit extra pairs ────────────────────────────────────────────
 # Adds q↔v and gate↔down within every block on top of the band.
 # Use '*' as a block-index wildcard — expands across all layers automatically.
-torchrun --nproc_per_node=8 get_hess_llama.py \
+torchrun --standalone --nproc-per-node=8 get_hess_llama.py \
     --orig_model  meta-llama/Llama-3.2-1B-Instruct \
     --save_path   /path/to/hessians \
     --n_seqs      65536 \
+    --ctx_size    2048 \
     --batch_size  2 \
     --hessian_sketch B \
+    --power_iters 1 \
     --cross \
+    --cross_estimator per_sample \
     --parent_band 1 \
     --parent_extra_pairs "*_q,*_v;*_gate,*_down"
 ```
@@ -188,7 +203,9 @@ torchrun --nproc_per_node=8 get_hess_llama.py \
 
 | argument | default | description |
 |---|---|---|
-| `--cross` | off | enable cross-Hessian collection |
+| `--cross` | off | enable cross-Hessian collection; when off, collection uses the original YAQA per-sample estimator |
+| `--cross_estimator` | `per_sample` | cross-Hessian estimator: `per_sample` matches original YAQA diagonal statistics; `batch_aggregate` preserves the earlier prototype behavior |
+| `--calib_dataset` | `redpajama` | calibration dataset: `redpajama` matches the original YAQA script; `c4` is the maintained fallback used by cross-Hessian experiments |
 | `--parent_band W` | `1` | collect pairs with `\|gidx_i − gidx_j\| ≤ W` (gidx distance) |
 | `--parent_block_window W` | off | collect pairs with `\|block_i − block_j\| ≤ W` (transformer block distance); overrides `--parent_band` when set |
 | `--parent_extra_pairs STR` | `""` | always collect these named pairs on top of the band (see format above) |

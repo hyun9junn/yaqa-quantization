@@ -33,6 +33,41 @@ _BATCH_ID  = [0]  # increments each backward pass
 _PAIRS_DONE = set()  # (i, j) pairs computed in current batch, i < j
 
 
+def layer_grad(grad_output, input, estimator):
+    if estimator == 'batch_aggregate':
+        return torch.einsum('btm,btn->mn', grad_output, input)
+    if estimator == 'per_sample':
+        return torch.einsum('btm,btn->bmn', grad_output, input)
+    raise ValueError(f'Unknown hessian estimator: {estimator}')
+
+
+def diagonal_hess_from_layer_grad(L):
+    if L.dim() == 2:
+        return sym_to_flat(L.T @ L), sym_to_flat(L @ L.T)
+    if L.dim() == 3:
+        return (
+            sym_to_flat(torch.einsum('bmn,bmk->nk', L, L)),
+            sym_to_flat(torch.einsum('bmn,bkn->mk', L, L)),
+        )
+    raise ValueError(f'Unsupported layer-gradient rank: {L.dim()}')
+
+
+def aggregate_layer_grad(L):
+    return L if L.dim() == 2 else L.sum(dim=0)
+
+
+def cross_factor_in(Li, Lj, r_m):
+    if Li.dim() == 2:
+        return Li[:r_m].T @ Lj[:r_m] / r_m
+    return torch.einsum('bmn,bmk->nk', Li[:, :r_m], Lj[:, :r_m]) / r_m
+
+
+def cross_factor_out(Li, Lj, r_n):
+    if Li.dim() == 2:
+        return Li[:, :r_n] @ Lj[:, :r_n].T / r_n
+    return torch.einsum('bmn,bkn->mk', Li[:, :, :r_n], Lj[:, :, :r_n]) / r_n
+
+
 def should_compute_cross_pair(filter_mode,
                               block_window,
                               layer_idx,
@@ -86,6 +121,7 @@ class LinearNoBias(torch.autograd.Function):
             layer_name = ctx.parent_class.layer_name
             cross_filter = ctx.parent_class.cross_filter
             cross_block_window = ctx.parent_class.cross_block_window
+            hessian_estimator = ctx.parent_class.hessian_estimator
 
             with torch.amp.autocast('cuda', enabled=False):
                 if it == 0:
@@ -97,18 +133,14 @@ class LinearNoBias(torch.autograd.Function):
                     grad_output = grad_output.float()
                     input = input.float()
 
-                    # L = G^T X  (shape: m_j x n_j)
-                    l_grad = torch.einsum('btm,btn->mn', grad_output, input)
-
-                    # Diagonal blocks via L
-                    in_hess = sym_to_flat(l_grad.T @ l_grad)      # (n_j x n_j)
+                    L = layer_grad(grad_output, input, hessian_estimator)
+                    in_hess, out_hess = diagonal_hess_from_layer_grad(L)
 
                     handle_in = torch.distributed.reduce(
                         in_hess,
                         ctx.parent_class.buffer_dev,
                         op=ReduceOp.AVG,
                         async_op=True)
-                    out_hess = sym_to_flat(l_grad @ l_grad.T)     # (m_j x m_j)
                     handle_out = torch.distributed.reduce(
                         out_hess,
                         ctx.parent_class.buffer_dev,
@@ -139,14 +171,14 @@ class LinearNoBias(torch.autograd.Function):
                             _LBUF.clear()
                             _PAIRS_DONE.clear()
 
-                        _LBUF[layer_idx] = (l_grad.detach().cpu(),
+                        _LBUF[layer_idx] = (L.detach().cpu(),
                                             ctx.parent_class.layer_name,
                                             block_idx)
 
                         # Compute cross with every other layer currently in the buffer.
                         # Use _PAIRS_DONE to ensure each pair is computed exactly once.
                         # This handles non-monotonic backward orders (e.g. SwiGLU: down→up→gate).
-                        Lj = l_grad
+                        Lj = L
                         devI = 'cpu' if ctx.parent_class.hin.device.type == 'cpu' else ctx.parent_class.buffer_dev
                         devO = 'cpu' if ctx.parent_class.hout.device.type == 'cpu' else ctx.parent_class.buffer_dev
 
@@ -171,36 +203,31 @@ class LinearNoBias(torch.autograd.Function):
 
                             Li = Li.to(Lj.device, non_blocking=True).to(Lj.dtype)
 
-                            m_i, n_i = Li.shape
-                            m_j, n_j = Lj.shape
+                            m_i, n_i = Li.shape[-2:]
+                            m_j, n_j = Lj.shape[-2:]
 
                             # Hybrid init: exact when dims match, rect truncation otherwise
-                            if m_i == m_j:
-                                cross_in_hess = (Li.T @ Lj / m_i).to(op_dtype).to(local_rank)
-                            else:
-                                r_m = min(m_i, m_j)
-                                cross_in_hess = (Li[:r_m].T @ Lj[:r_m] / r_m).to(op_dtype).to(local_rank)
-
-                            if n_i == n_j:
-                                cross_out_hess = (Li @ Lj.T / n_i).to(op_dtype).to(local_rank)
-                            else:
-                                r_n = min(n_i, n_j)
-                                cross_out_hess = (Li[:, :r_n] @ Lj[:, :r_n].T / r_n).to(op_dtype).to(local_rank)
+                            r_m = min(m_i, m_j)
+                            r_n = min(n_i, n_j)
+                            cross_in_hess = cross_factor_in(Li, Lj, r_m).to(op_dtype).to(local_rank)
+                            cross_out_hess = cross_factor_out(Li, Lj, r_n).to(op_dtype).to(local_rank)
 
                             # Local ALS for unequal-dim pairs
                             if (m_i != m_j or n_i != n_j) and n_als > 0:
                                 H_I = cross_in_hess.float()
                                 H_O = cross_out_hess.float()
+                                Li_als = aggregate_layer_grad(Li)
+                                Lj_als = aggregate_layer_grad(Lj)
                                 # Normalise L matrices to unit Frobenius norm before ALS.
                                 # Without this, ||Li||·||Lj|| ~ 10^9 causes the alternating
                                 # updates to explode in O(||Li||^2·||Lj||^2) steps.
                                 # H_I and H_O also stay normalised inside ALS because their
                                 # scale is non-identifiable: c*H_I and H_O/c represent the
                                 # same Kronecker product.
-                                Li_scale = Li.float().norm().clamp(min=1e-30)
-                                Lj_scale = Lj.float().norm().clamp(min=1e-30)
-                                Li_f = Li.float() / Li_scale
-                                Lj_f = Lj.float() / Lj_scale
+                                Li_scale = Li_als.float().norm().clamp(min=1e-30)
+                                Lj_scale = Lj_als.float().norm().clamp(min=1e-30)
+                                Li_f = Li_als.float() / Li_scale
+                                Lj_f = Lj_als.float() / Lj_scale
                                 H_I = H_I / H_I.norm().clamp(min=1e-30)
                                 H_O = H_O / H_O.norm().clamp(min=1e-30)
                                 for _ in range(n_als):
@@ -220,7 +247,7 @@ class LinearNoBias(torch.autograd.Function):
                                 n_eff = (n_i * n_j) ** 0.5
                                 cross_in_hess  = (H_I_dir * (scale_I * Li_scale * Lj_scale / m_eff)).to(op_dtype)
                                 cross_out_hess = (H_O_dir * (scale_O * Li_scale * Lj_scale / n_eff)).to(op_dtype)
-                                del H_I, H_O, H_I_dir, H_O_dir, Li_f, Lj_f
+                                del H_I, H_O, H_I_dir, H_O_dir, Li_als, Lj_als, Li_f, Lj_f
 
                             torch.distributed.reduce(cross_in_hess,  ctx.parent_class.buffer_dev, op=ReduceOp.AVG)
                             torch.distributed.reduce(cross_out_hess, ctx.parent_class.buffer_dev, op=ReduceOp.AVG)
@@ -245,7 +272,7 @@ class LinearNoBias(torch.autograd.Function):
                             del Li
                             torch.cuda.empty_cache()
 
-                    del l_grad
+                    del L
                     torch.cuda.empty_cache()
                 else:
                     # Additional power iterations on B are not optimized and should be rewritten with einsums.
@@ -271,6 +298,7 @@ class CustomLinear(nn.Linear):
                  cross_filter='none',
                  cross_block_window=1,
                  extra_pairs=frozenset(),
+                 hessian_estimator='per_sample',
                  **kwargs):
         super().__init__(*args, **kwargs)
 
@@ -278,6 +306,8 @@ class CustomLinear(nn.Linear):
             raise ValueError(f'Unknown cross_filter: {cross_filter}')
         if cross_block_window < 0:
             raise ValueError('cross_block_window must be non-negative')
+        if hessian_estimator not in ('per_sample', 'batch_aggregate'):
+            raise ValueError(f'Unknown hessian_estimator: {hessian_estimator}')
 
         self.fname = load_fname
         self.layer_idx = layer_idx
@@ -286,6 +316,7 @@ class CustomLinear(nn.Linear):
         self.cross_filter = cross_filter
         self.cross_block_window = cross_block_window
         self.extra_pairs = frozenset(extra_pairs)
+        self.hessian_estimator = hessian_estimator
         self.collect_hess = collect_hess
         self.op_dtype = torch.float32 if not use_fp64 else torch.float64
         if collect_hess and local_rank == buffer_dev:
