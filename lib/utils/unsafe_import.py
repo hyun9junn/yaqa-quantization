@@ -8,8 +8,13 @@ import torch
 import transformers
 
 from model.llama import LlamaForCausalLM
-from model.llama4 import Llama4ForCausalLM
-from model.llama4_orig import Llama4ForCausalLM as Llama4ForCausalLMOrig
+
+try:
+    from model.llama4 import Llama4ForCausalLM
+    from model.llama4_orig import Llama4ForCausalLM as Llama4ForCausalLMOrig
+except ModuleNotFoundError:
+    Llama4ForCausalLM = None
+    Llama4ForCausalLMOrig = None
 
 
 def model_from_hf_path(path, max_mem_ratio=0.7, device_map=None):
@@ -25,6 +30,9 @@ def model_from_hf_path(path, max_mem_ratio=0.7, device_map=None):
                 path)._name_or_path
             model_cls = LlamaForCausalLM
         elif model_type.startswith('llama4'):
+            if Llama4ForCausalLM is None:
+                raise ImportError(
+                    'model.llama4 is required to load quantized Llama4 models')
             model_str = transformers.LlamaConfig.from_pretrained(
                 path)._name_or_path
             model_cls = Llama4ForCausalLM
@@ -32,6 +40,9 @@ def model_from_hf_path(path, max_mem_ratio=0.7, device_map=None):
             raise Exception
     else:
         if model_type.startswith('llama4'):
+            if Llama4ForCausalLMOrig is None:
+                raise ImportError(
+                    'model.llama4_orig is required to load Llama4 models')
             model_str = transformers.LlamaConfig.from_pretrained(
                 path)._name_or_path
             model_cls = Llama4ForCausalLMOrig

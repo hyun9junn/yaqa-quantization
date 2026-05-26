@@ -110,11 +110,12 @@ torchrun --standalone --nproc-per-node=1 hessian_llama/get_hess_llama.py \
   --hessian_sketch B \
   --power_iters 1 \
   --ctx_size 2048 \
-  --n_seqs 65536 \
+  --n_seqs 2048 \
   --cpu_offload \
   --cross \
   --cross_estimator per_sample \
-  --parent_band 1
+  --parent_band 1 \
+  --calib_dataset c4
 ```
 
 Denser within-block and adjacent-block candidate collection:
@@ -132,7 +133,8 @@ torchrun --standalone --nproc-per-node=1 hessian_llama/get_hess_llama.py \
   --cpu_offload \
   --cross \
   --cross_estimator per_sample \
-  --parent_block_window 1
+  --parent_block_window 1 \
+  --calib_dataset c4
 ```
 
 If you already suspect specific structural pairs, add them during collection:
@@ -279,6 +281,109 @@ python quantize_llama/quantize_cross_hess_llama.py \
   --parent_explicit "*_v:*_q"
 ```
 
+## Step 4: Convert Quantized Outputs To HF Format
+
+`quantize_cross_hess_llama.py` writes raw quantized layer shards such as
+`0_q.pt`, `0_k.pt`, and `config.pt`. The eval scripts load Hugging Face style
+model directories, so convert each quantized output with `hfize_llama.py` before
+evaluation.
+
+Use a separate `_hf` directory for each experiment:
+
+```bash
+PYTHONPATH=. python quantize_llama/hfize_llama.py \
+  --quantized_path quantize_llama/no_cross_from_cross_hess \
+  --hf_output_path quantize_llama/no_cross_from_cross_hess_hf
+
+PYTHONPATH=. python quantize_llama/hfize_llama.py \
+  --quantized_path quantize_llama/selected_pairs_only \
+  --hf_output_path quantize_llama/selected_pairs_only_hf
+
+PYTHONPATH=. python quantize_llama/hfize_llama.py \
+  --quantized_path quantize_llama/band1_plus_selected \
+  --hf_output_path quantize_llama/band1_plus_selected_hf
+```
+
+If evaluation fails with `No module named 'lib'`, run from the repository root
+and keep `PYTHONPATH=.` in the command. If it fails with missing
+`model.safetensors` or `pytorch_model.bin`, the raw quantized directory was used
+directly; pass the corresponding `_hf` directory to eval instead.
+
+## Step 5: Evaluate
+
+Run every experiment with the same tokenizer, seed, sequence length, and task
+list. Lower PPL and KL are better; higher downstream accuracy is better.
+
+### Perplexity
+
+```bash
+PYTHONPATH=. python eval/eval_ppl.py \
+  --hf_path quantize_llama/no_cross_from_cross_hess_hf \
+  --tokenizer meta-llama/Llama-3.2-1B-Instruct \
+  --seqlen 2048 \
+  --manifest
+
+PYTHONPATH=. python eval/eval_ppl.py \
+  --hf_path quantize_llama/selected_pairs_only_hf \
+  --tokenizer meta-llama/Llama-3.2-1B-Instruct \
+  --seqlen 2048 \
+  --manifest
+```
+
+The script reports `wikitext2 perplexity` and `c4 perplexity`. Use `--seqlen
+2048` for quick checks and the same larger context, such as `8192`, for final
+reported numbers if memory allows.
+
+### KL To The Original Model
+
+```bash
+PYTHONPATH=. python eval/eval_kl.py \
+  --orig_path meta-llama/Llama-3.2-1B-Instruct \
+  --hf_path quantize_llama/no_cross_from_cross_hess_hf \
+  --tokenizer meta-llama/Llama-3.2-1B-Instruct \
+  --seqlen 2048 \
+  --manifest
+
+PYTHONPATH=. python eval/eval_kl.py \
+  --orig_path meta-llama/Llama-3.2-1B-Instruct \
+  --hf_path quantize_llama/selected_pairs_only_hf \
+  --tokenizer meta-llama/Llama-3.2-1B-Instruct \
+  --seqlen 2048 \
+  --manifest
+```
+
+### Zero-Shot Downstream Tasks
+
+```bash
+mkdir -p eval_results
+
+PYTHONPATH=. python eval/eval_zeroshot.py \
+  --hf_path quantize_llama/no_cross_from_cross_hess_hf \
+  --tokenizer meta-llama/Llama-3.2-1B-Instruct \
+  --tasks hellaswag,piqa,winogrande,arc_easy,arc_challenge \
+  --batch_size 1 \
+  --num_fewshot 0 \
+  --manifest_model \
+  --output_path eval_results/no_cross_from_cross_hess.pt
+
+PYTHONPATH=. python eval/eval_zeroshot.py \
+  --hf_path quantize_llama/selected_pairs_only_hf \
+  --tokenizer meta-llama/Llama-3.2-1B-Instruct \
+  --tasks hellaswag,piqa,winogrande,arc_easy,arc_challenge \
+  --batch_size 1 \
+  --num_fewshot 0 \
+  --manifest_model \
+  --output_path eval_results/selected_pairs_only.pt
+```
+
+Suggested result table:
+
+| Experiment | HF path | Wikitext2 PPL ↓ | C4 PPL ↓ | Wikitext2 KL ↓ | Downstream acc ↑ |
+|---|---|---:|---:|---:|---:|
+| no-cross from cross dir | `quantize_llama/no_cross_from_cross_hess_hf` | | | | |
+| selected only | `quantize_llama/selected_pairs_only_hf` | | | | |
+| band-1 + selected | `quantize_llama/band1_plus_selected_hf` | | | | |
+
 ## Suggested Experiment Table
 
 | Experiment | Hessian dir | Quant args | Purpose |
@@ -331,4 +436,5 @@ python hessian_llama/select_cross_hessian_pairs.py \
 --parent_band 1 --parent_map hessian_llama/cross_block_window1/parents_top4_types.json
 ```
 
-5. Evaluate all outputs with the same downstream eval command.
+5. Convert each raw quantized output with `hfize_llama.py`.
+6. Evaluate the `_hf` outputs with the same downstream eval command.
